@@ -68,6 +68,20 @@ public enum Provider: String, CaseIterable {
         }
     }
 
+    /// swift-corelibs-foundation builds the WebSocket handshake with `Connection: keep-alive`, which RFC 6455
+    /// forbids (it must be `Upgrade`) and strict servers reject outright. Sending the correct pair ourselves is
+    /// enough: the header survives into the request URLSession makes.
+    func websocketHandshakeFix(_ request: URLRequest) -> URLRequest {
+        #if canImport(Darwin)
+        return request
+        #else
+        var fixed = request
+        fixed.setValue("Upgrade", forHTTPHeaderField: "Connection")
+        fixed.setValue("websocket", forHTTPHeaderField: "Upgrade")
+        return fixed
+        #endif
+    }
+
     /// The connection request. OpenAI and xAI take the key as a bearer header. Gemini Live only accepts it as a
     /// `key` query parameter, so this URL must never be logged (nothing in herdr-voice logs URLs).
     public func request(key: String) -> URLRequest {
@@ -75,15 +89,15 @@ public enum Provider: String, CaseIterable {
         case .local:
             var request = URLRequest(url: url)
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            return request
+            return websocketHandshakeFix(request)
         case .openai, .grok:
             var request = URLRequest(url: url)
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            return request
+            return websocketHandshakeFix(request)
         case .gemini:
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
             components.queryItems = [URLQueryItem(name: "key", value: key)]
-            return URLRequest(url: components.url!)
+            return websocketHandshakeFix(URLRequest(url: components.url!))
         }
     }
 
