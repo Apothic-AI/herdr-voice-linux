@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# End-to-end check for the Linux audio path.
+#
+# Builds the package, compiles the measurement driver against the same Linux audio sources, then exercises the real
+# PortAudio streams on the real devices: capture cadence and payload, playback through the speaker verified at the
+# microphone, software echo cancellation measured as echo energy with the canceller on versus off, and the steady
+# state CPU cost of a live canceller.
+#
+# Exits non-zero if any check fails. Evidence (WAVs, aec.txt) lands in /tmp/audio-evidence.
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+EVIDENCE=${HERDR_VOICE_EVIDENCE:-/tmp/audio-evidence}
+LOGS=${HERDR_VOICE_LOGS:-/tmp/logs}
+DRIVER="$EVIDENCE/linux-audio-driver"
+FAILURES=0
+
+mkdir -p "$EVIDENCE" "$LOGS"
+
+pass() { echo "PASS $*"; }
+fail() { echo "FAIL $*"; FAILURES=$((FAILURES + 1)); }
+
+# Pull `key=value` out of the driver's `RESULT` lines.
+metric() { # metric <file> <key>
+    sed -n "s/.*[^a-z_]$2=\([-0-9.a-zA-Z]*\).*/\1/p" "$1" | head -1
+}
+
+echo "=== 1. swift build ==="
+if swift build --package-path "$ROOT" >"$LOGS/audio-build.log" 2>&1; then
+    pass "swift build exit 0 ($(tail -1 "$LOGS/audio-build.log"))"
+else
+    fail "swift build failed; see $LOGS/audio-build.log"
+    tail -20 "$LOGS/audio-build.log"
+    exit 1
+fi
+
+echo "=== 2. compile the measurement driver ==="
+if swiftc -O -I "$ROOT/.build/debug/Modules" \
+    "$ROOT/Sources/herdr-voice/Linux/Audio.swift" \
+    "$ROOT/Sources/herdr-voice/Linux/AudioEngine.swift" \
+    "$ROOT/Sources/herdr-voice/Linux/AudioPortAudio.swift" \
+    "$ROOT/Sources/herdr-voice/Linux/AudioAEC.swift" \
+    "$ROOT/Sources/herdr-voice/Linux/AudioResampler.swift" \
+    "$ROOT/Sources/herdr-voice/Linux/AudioRing.swift" \
+    "$ROOT/scripts/linux-audio-driver.swift" \
+    "$ROOT"/.build/debug/HerdrVoiceCore.build/*.o \
+    -o "$DRIVER" >"$LOGS/audio-driver-build.log" 2>&1; then
+    pass "driver compiled"
+else
+    fail "driver failed to compile; see $LOGS/audio-driver-build.log"
+    tail -30 "$LOGS/audio-driver-build.log"
+    exit 1
+fi
+
+echo "=== 3. devices ==="
+"$DRIVER" devices >"$EVIDENCE/devices.txt" 2>"$LOGS/audio-devices.err"
+if [ $? -ne 0 ]; then
+    fail "device enumeration failed: $(head -3 "$LOGS/audio-devices.err")"
+else
+    grep -E '^(RESULT|DEVICE)' "$EVIDENCE/devices.txt" | sed 's/^/    /'
+    pass "PortAudio devices enumerated"
+fi
+# The platform's own canceller would be the preferred Linux equivalent of Apple's voice processing; record whether
+# this box has one, because it decides which canceller the check is measuring.
+if pactl list short sources 2>/dev/null | grep -q 'echo-cancel'; then
+    PLATFORM_EC="yes: $(pactl list short sources | grep 'echo-cancel' | head -1)"
+else
+    PLATFORM_EC="no"
+fi
+echo "    platform echo-cancel source: $PLATFORM_EC"
+
+echo "=== 4. capture ==="
+"$DRIVER" capture 1.5 >"$EVIDENCE/capture.txt" 2>"$LOGS/audio-capture.err"
+CAPTURE_STATUS=$?
+grep -E '^RESULT' "$EVIDENCE/capture.txt" | sed 's/^/    /'
+if [ $CAPTURE_STATUS -eq 0 ] && grep -q '^PASS' "$EVIDENCE/capture.txt"; then
+    pass "$(grep '^PASS' "$EVIDENCE/capture.txt" | sed 's/^PASS //')"
+else
+    fail "capture check failed: $(grep -E '^(FAIL|RESULT payload)' "$EVIDENCE/capture.txt" | head -2 | tr '\n' ' ')"
+fi
+
+echo "=== 5. playback through the real device ==="
+"$DRIVER" playback >"$EVIDENCE/playback.txt" 2>"$LOGS/audio-playback.err"
+PLAYBACK_STATUS=$?
+grep -E '^RESULT' "$EVIDENCE/playback.txt" | sed 's/^/    /'
+if [ $PLAYBACK_STATUS -eq 0 ] && grep -q '^PASS' "$EVIDENCE/playback.txt"; then
+    pass "$(grep '^PASS' "$EVIDENCE/playback.txt" | sed 's/^PASS //')"
+else
+    fail "playback check failed: $(grep '^FAIL' "$EVIDENCE/playback.txt" | head -1)"
+fi
+
+echo "=== 6. synthetic echo path (canceller in isolation) ==="
+"$DRIVER" synthetic >"$EVIDENCE/synthetic-aec.txt" 2>"$LOGS/audio-synthetic.err"
+SYNTHETIC_STATUS=$?
+grep -E '^RESULT' "$EVIDENCE/synthetic-aec.txt" | sed 's/^/    /'
+SYNTHETIC_ERLE=$(metric "$EVIDENCE/synthetic-aec.txt" erle_db)
+if [ $SYNTHETIC_STATUS -eq 0 ]; then
+    pass "synthetic echo path suppressed by ${SYNTHETIC_ERLE:-?} dB (>= 15 dB required)"
+else
+    fail "synthetic cancellation below target: $(grep '^FAIL' "$EVIDENCE/synthetic-aec.txt" | head -1)"
+fi
+
+echo "=== 7. echo cancellation: loopback (gated), then acoustic (reported) ==="
+# A shared machine's acoustic path is at the mercy of whatever else is playing and clips the microphone when the
+# room is loud, so the deterministic measurement is a loopback: the same shipping code path — PortAudio out,
+# PortAudio in, the real resamplers and the real canceller — with an echo path that cannot be polluted. The
+# acoustic run is measured too, and reported, because that is what a user experiences.
+LOOP_CARD=""
+if lsmod 2>/dev/null | grep -q '^snd_aloop' || sudo -n modprobe snd-aloop 2>/dev/null; then
+    "$DRIVER" devices >"$EVIDENCE/devices.txt" 2>/dev/null
+    LOOP_CARD=$(grep -i 'Loopback: PCM' "$EVIDENCE/devices.txt" | sed -n 's/.*(hw:\([0-9]*\),0).*/\1/p' | head -1)
+fi
+
+if [ -n "${LOOP_CARD:-}" ]; then
+    # The rate is pinned because an open/close rate probe can block on a virtual device.
+    LOOP_ENV="HERDR_VOICE_OUTPUT_DEVICE=hw:$LOOP_CARD,0 HERDR_VOICE_INPUT_DEVICE=hw:$LOOP_CARD,1 HERDR_VOICE_DEVICE_RATE=48000"
+    env $LOOP_ENV timeout 45 "$DRIVER" aec off 3 >"$EVIDENCE/aec-loopback-off.txt" 2>"$LOGS/audio-loop-off.err" \
+        || env $LOOP_ENV timeout 45 "$DRIVER" aec off 3 >"$EVIDENCE/aec-loopback-off.txt" 2>"$LOGS/audio-loop-off.err"
+    LOOP_OFF_STATUS=$?
+    cp "$EVIDENCE/aec-off-capture-24k.wav" "$EVIDENCE/aec-loopback-off.wav" 2>/dev/null
+    env $LOOP_ENV timeout 45 "$DRIVER" aec on 3 >"$EVIDENCE/aec-loopback-on.txt" 2>"$LOGS/audio-loop-on.err" \
+        || env $LOOP_ENV timeout 45 "$DRIVER" aec on 3 >"$EVIDENCE/aec-loopback-on.txt" 2>"$LOGS/audio-loop-on.err"
+    LOOP_ON_STATUS=$?
+    cp "$EVIDENCE/aec-on-capture-24k.wav" "$EVIDENCE/aec-loopback-on.wav" 2>/dev/null
+    grep -E '^RESULT (input|output|device_rate|echo_tone_db|echo_rms|canceller_erle)' "$EVIDENCE/aec-loopback-off.txt" | sed 's/^/    off /'
+    grep -E '^RESULT (input|output|device_rate|echo_tone_db|echo_rms|canceller_erle)' "$EVIDENCE/aec-loopback-on.txt" | sed 's/^/    on  /'
+    LOOP_OFF_DB=$(metric "$EVIDENCE/aec-loopback-off.txt" echo_tone_db)
+    LOOP_ON_DB=$(metric "$EVIDENCE/aec-loopback-on.txt" echo_tone_db)
+    LOOP_OFF_RMS=$(metric "$EVIDENCE/aec-loopback-off.txt" echo_rms)
+    LOOP_ON_RMS=$(metric "$EVIDENCE/aec-loopback-on.txt" echo_rms)
+    if [ $LOOP_OFF_STATUS -ne 0 ] || [ $LOOP_ON_STATUS -ne 0 ] || [ -z "${LOOP_OFF_DB:-}" ] || [ -z "${LOOP_ON_DB:-}" ]; then
+        fail "loopback AEC runs failed (off=$LOOP_OFF_STATUS on=$LOOP_ON_STATUS); see $LOGS/audio-loop-*.err"
+    else
+        LOOP_SUPPRESSION=$(awk -v off="$LOOP_OFF_DB" -v on="$LOOP_ON_DB" 'BEGIN { printf "%.1f", off - on }')
+        LOOP_RMS_SUPPRESSION=$(awk -v off="${LOOP_OFF_RMS:-0}" -v on="${LOOP_ON_RMS:-0}" 'BEGIN {
+            if (off <= 0 || on <= 0) { print "0.0" } else { printf "%.1f", 20 * log(off / on) / log(10) }
+        }')
+        LOOP_MEASURED=1
+    fi
+else
+    echo "    no loopback device available (snd-aloop could not be loaded); relying on the acoustic measurement"
+    LOOP_SUPPRESSION="n/a"
+    LOOP_RMS_SUPPRESSION="n/a"
+    LOOP_MEASURED=0
+fi
+
+# Acoustic: the real speaker and the real microphone. Reported, not gated — its level depends on the room, the
+# sink volume, and anything else playing on this machine.
+CONCURRENT_STREAMS=$(pactl list short sink-inputs 2>/dev/null | wc -l | tr -d ' ')
+"$DRIVER" aec off 3 >"$EVIDENCE/aec-off.txt" 2>"$LOGS/audio-aec-off.err"
+"$DRIVER" aec on 3 >"$EVIDENCE/aec-on.txt" 2>"$LOGS/audio-aec-on.err"
+ACOUSTIC_OFF_DB=$(metric "$EVIDENCE/aec-off.txt" echo_tone_db)
+ACOUSTIC_ON_DB=$(metric "$EVIDENCE/aec-on.txt" echo_tone_db)
+ACOUSTIC_OFF_RMS=$(metric "$EVIDENCE/aec-off.txt" echo_rms)
+ACOUSTIC_ON_RMS=$(metric "$EVIDENCE/aec-on.txt" echo_rms)
+ACOUSTIC_ERLE=$(metric "$EVIDENCE/aec-on.txt" canceller_erle_db)
+if [ -n "${ACOUSTIC_OFF_DB:-}" ] && [ -n "${ACOUSTIC_ON_DB:-}" ]; then
+    ACOUSTIC_SUPPRESSION=$(awk -v off="$ACOUSTIC_OFF_DB" -v on="$ACOUSTIC_ON_DB" 'BEGIN { printf "%.1f", off - on }')
+    echo "    acoustic: ${ACOUSTIC_OFF_DB} -> ${ACOUSTIC_ON_DB} dBFS at 700 Hz (${ACOUSTIC_SUPPRESSION} dB), ${CONCURRENT_STREAMS} other stream(s) playing"
+    if awk -v s="$ACOUSTIC_SUPPRESSION" 'BEGIN { exit !(s < 3) }'; then
+        echo "    note: the acoustic path shows little cancellation — expected when the room is loud or another"
+        echo "          stream is playing; the loopback above is the deterministic measurement of the canceller."
+    fi
+else
+    ACOUSTIC_SUPPRESSION="n/a"
+    ACOUSTIC_ERLE="n/a"
+fi
+
+# Gate on whichever real measurement succeeded. Both are the shipping path; the loopback is the one that is
+# reproducible on a quiet machine, the acoustic one is what a user actually gets.
+GATED=0
+if [ "${LOOP_MEASURED:-0}" = "1" ] && [ "${LOOP_SUPPRESSION:-n/a}" != "n/a" ] \
+   && awk -v s="$LOOP_SUPPRESSION" 'BEGIN { exit !(s >= 15) }'; then
+    pass "loopback echo at 700 Hz suppressed by ${LOOP_SUPPRESSION} dB (${LOOP_OFF_DB} -> ${LOOP_ON_DB} dBFS, >= 15 dB required)"
+    GATED=1
+fi
+if [ $GATED -eq 0 ] && [ "${ACOUSTIC_SUPPRESSION:-n/a}" != "n/a" ] \
+   && awk -v s="$ACOUSTIC_SUPPRESSION" 'BEGIN { exit !(s >= 15) }'; then
+    pass "acoustic echo at 700 Hz suppressed by ${ACOUSTIC_SUPPRESSION} dB (${ACOUSTIC_OFF_DB} -> ${ACOUSTIC_ON_DB} dBFS, >= 15 dB required)"
+    GATED=1
+fi
+if [ $GATED -eq 0 ]; then
+    fail "no echo path showed >= 15 dB suppression (loopback ${LOOP_SUPPRESSION:-n/a} dB, acoustic ${ACOUSTIC_SUPPRESSION:-n/a} dB)"
+fi
+
+{
+    echo "Linux audio: echo cancellation, measured through the shipping capture and playback paths"
+    echo "  $(date -Is)"
+    echo "  host: $(hostname), $(uname -sr)"
+    grep -E '^RESULT (input|output|device_rate|latency|aec)=' "$EVIDENCE/aec-loopback-on.txt" 2>/dev/null | sed 's/^/  /'
+    echo "  platform echo-cancel source: $PLATFORM_EC"
+    echo
+    echo "  Reference: 700 Hz tone plus deterministic white noise, played through the real playback path and read"
+    echo "  back through the real capture path. The first 1.5 s (adaptation) is skipped; 3 s are measured."
+    echo
+    echo "  Loopback (ALSA snd-aloop: the deterministic path, what the check gates on)"
+    printf "    %-30s %12s %12s\n" "metric" "AEC off" "AEC on"
+    printf "    %-30s %12s %12s\n" "echo tone @700 Hz (dBFS)" "${LOOP_OFF_DB:-n/a}" "${LOOP_ON_DB:-n/a}"
+    printf "    %-30s %12s %12s\n" "capture rms" "${LOOP_OFF_RMS:-n/a}" "${LOOP_ON_RMS:-n/a}"
+    echo "    tone suppression : ${LOOP_SUPPRESSION:-n/a} dB"
+    echo "    rms suppression  : ${LOOP_RMS_SUPPRESSION:-n/a} dB"
+    echo "    WAVs: $EVIDENCE/aec-loopback-off.wav, $EVIDENCE/aec-loopback-on.wav"
+    echo
+    echo "  Acoustic (speaker to microphone, same code path, room dependent — reported, not gated)"
+    printf "    %-30s %12s %12s\n" "echo tone @700 Hz (dBFS)" "${ACOUSTIC_OFF_DB:-n/a}" "${ACOUSTIC_ON_DB:-n/a}"
+    printf "    %-30s %12s %12s\n" "capture rms" "${ACOUSTIC_OFF_RMS:-n/a}" "${ACOUSTIC_ON_RMS:-n/a}"
+    printf "    %-30s %12s %12s\n" "canceller-reported ERLE (dB)" "-" "${ACOUSTIC_ERLE:-n/a}"
+    echo "    tone suppression : ${ACOUSTIC_SUPPRESSION:-n/a} dB"
+    echo "    other streams playing during the run: ${CONCURRENT_STREAMS:-0}"
+    echo "    WAVs: $EVIDENCE/aec-off-capture-24k.wav, $EVIDENCE/aec-on-capture-24k.wav"
+    echo
+    echo "  Synthetic (the canceller alone against a known echo path): ${SYNTHETIC_ERLE:-n/a} dB"
+    echo "  Canceller: unconstrained bin-normalised partitioned-block FDAF, 16 x 240 taps = 160 ms tail at 24 kHz."
+} >"$EVIDENCE/aec.txt"
+echo "    wrote $EVIDENCE/aec.txt"
+
+echo "=== 8. CPU cost with a live canceller ==="
+"$DRIVER" cpu 5 >"$EVIDENCE/cpu.txt" 2>"$LOGS/audio-cpu.err"
+CPU_STATUS=$?
+grep -E '^RESULT' "$EVIDENCE/cpu.txt" | sed 's/^/    /'
+CPU_PERCENT=$(metric "$EVIDENCE/cpu.txt" cpu_percent_of_one_core)
+if [ $CPU_STATUS -eq 0 ]; then
+    pass "capture + playback + canceller used ${CPU_PERCENT:-?}% of one core"
+else
+    fail "CPU measurement run failed; see $LOGS/audio-cpu.err"
+fi
+
+echo
+echo "=== summary ==="
+echo "evidence: $EVIDENCE"
+ls -1 "$EVIDENCE" | sed 's/^/    /'
+if [ "$FAILURES" -ne 0 ]; then
+    echo "FAIL $FAILURES check(s) failed"
+    exit 1
+fi
+echo "PASS all audio checks"
+exit 0
