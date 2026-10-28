@@ -167,6 +167,8 @@ enum X11Errors {
 
     private static let lock = NSLock()
     private static var records: [(display: OpaquePointer?, code: UInt8)] = []
+    /// How many times each distinct failure has been seen, so it can be reported once and counted after that.
+    private static var announced: [String: Int] = [:]
     private static var installed = false
 
     static func install(_ setHandler: (XErrorHandlerFn?) -> UnsafeMutableRawPointer?) {
@@ -178,11 +180,50 @@ enum X11Errors {
         _ = setHandler(x11ErrorHandler as XErrorHandlerFn)
     }
 
-    fileprivate static func record(display: OpaquePointer?, code: UInt8) {
+    fileprivate static func record(display: OpaquePointer?, code: UInt8, request: UInt8, minor: UInt8) {
+        let signature = "\(code)/\(request)/\(minor)"
         lock.lock()
         records.append((display, code))
         if records.count > 64 { records.removeFirst(records.count - 64) }
+        let seen = (announced[signature] ?? 0) + 1
+        announced[signature] = seen
         lock.unlock()
+        // Once per distinct failure, then silence: a per-frame present error would otherwise bury every other line.
+        // The default is worse than noisy — Xlib says nothing at all, which is how a rejected `XPutImage` became a
+        // window that was mapped, `IsViewable` and entirely blank with no trace in any log.
+        guard seen == 1 else { return }
+        log("✖ X11 error \(name(code)) (\(code)) on request \(request)/\(minor): the server dropped it")
+    }
+
+    /// The X protocol error names from Xproto.h, spelled out so reporting one never re-enters Xlib.
+    static func name(_ code: UInt8) -> String {
+        switch code {
+        case 1: "BadRequest"
+        case 2: "BadValue"
+        case 3: "BadWindow"
+        case 4: "BadPixmap"
+        case 5: "BadAtom"
+        case 6: "BadCursor"
+        case 7: "BadFont"
+        case 8: "BadMatch"
+        case 9: "BadDrawable"
+        case 10: "BadAccess"
+        case 11: "BadAlloc"
+        case 12: "BadColor"
+        case 13: "BadGC"
+        case 14: "BadIDChoice"
+        case 15: "BadName"
+        case 16: "BadLength"
+        case 17: "BadImplementation"
+        default: "error \(code)"
+        }
+    }
+
+    /// Every distinct failure seen so far, keyed `code/request/minor`, with how many times it happened.
+    static var counts: [String: Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return announced
     }
 
     /// Forgets errors so far, for the display whose next calls are being judged.
@@ -203,12 +244,14 @@ enum X11Errors {
 }
 
 /// `XErrorEvent` is `{int type; Display *display; XID resourceid; unsigned long serial; unsigned char error_code;
-/// unsigned char request_code; unsigned char minor_code;}`. Only `error_code` is wanted, and reading it at its
-/// documented offset avoids mirroring the whole struct in Swift just to throw it away.
+/// unsigned char request_code; unsigned char minor_code;}`. Only the three trailing bytes are wanted, and reading them at
+/// their documented offsets avoids mirroring the whole struct in Swift just to throw it away.
 private func x11ErrorHandler(_ display: OpaquePointer?, _ event: OpaquePointer?) -> Int32 {
     guard let event else { return 0 }
     let code = UnsafeRawPointer(event).load(fromByteOffset: 32, as: UInt8.self)
-    X11Errors.record(display: display, code: code)
+    let request = UnsafeRawPointer(event).load(fromByteOffset: 33, as: UInt8.self)
+    let minor = UnsafeRawPointer(event).load(fromByteOffset: 34, as: UInt8.self)
+    X11Errors.record(display: display, code: code, request: request, minor: minor)
     return 0 // Swallow it: Xlib's default handler prints to stderr and we already know what happened.
 }
 
