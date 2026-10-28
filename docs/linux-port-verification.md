@@ -92,6 +92,20 @@ them, and silently checks the wrong window:
 | Placed bottom-left of the tracked window | `xwininfo -id 0x2a00002` | `Absolute upper-left X: 4, Y: 925` |
 | Composited (ARGB path) | app log | the `composited` line above, with `screenshot` captured during playback (`import -window 0x2a00002`) |
 | Frame rate | app log | `◎ orb: active, 60 fps` while speaking, `◎ orb: idle, 30 fps` when idle |
+| Presented pixels | `./scripts/linux-orb-check` | the window read back with `XGetImage`: **630–3 609 colours per mood**, alpha 100–122 of 255 |
+| Actually on screen | `./scripts/linux-orb-check` | the same region captured from the **root** window differs in **6 328–8 640 of 9 216 pixels** |
+| X errors | app log | none during a run; a deliberately invalid request is reported as `✖ X11 error BadWindow (3) on request 4/0` |
+
+The pixels reach the window from a Cairo image surface through an `XImage` that borrows Cairo's own buffer, with
+Cairo's stride as `bytes_per_line`. That detail is the whole difference between an orb and a blank window:
+`XCreateImage` asked for its data with a NULL pointer allocates nothing and returns an image whose `data` is NULL, and
+an image with no buffer puts no pixels anywhere — without an error, because a present the server rejects is reported
+asynchronously and, with no handler installed, not at all.
+
+`X11Errors` therefore installs a handler that logs each distinct failure once (code, request, minor), and
+`./scripts/linux-orb-check` keeps both properties honest: it asserts real pixels in the window **and** a changed
+capture of the same region from the root window, and it requires a control window that is mapped and `IsViewable` but
+never drawn into to *fail* that same assertion.
 
 The ARGB path is the composited one. Without a compositor there is no alpha to composite, so the orb draws itself
 opaque with its own shadow instead — observed on `Xvfb :99`:
@@ -176,6 +190,7 @@ dribble, two messages coalesced into one frame, the measured 4092/2381 signature
 
     ./scripts/linux-audio-check              # device round trip, levels, AEC (PULSE_SINK=hv_null to stay silent)
     ./scripts/linux-x11-check                # window tracking, hide/restore, polling rate, hotkeys, conflicts
+    ./scripts/linux-orb-check                # the orb's presented pixels, from its window and from the root
     ./scripts/linux-voice-loop-check         # the full loop against the local protocol stub
     swift test                               # 200 tests
 
@@ -195,6 +210,8 @@ Swift 6.0.3. All audio was routed to a null sink (`PULSE_SINK=hv_null`) so nothi
 | Session loop | decoding | **0** undecodable events after frame reassembly |
 | Orb | `xwininfo` on the app's own window | 96×96, `Override Redirect State: yes`, **32-bit ARGB visual, composited** |
 | Orb | frame rate | **60 fps active / 30 fps idle** (logged transitions) |
+| Orb | `./scripts/linux-orb-check` | **20 checks, 0 failures** — 630–3 609 colours per mood, the root capture differs in 6 328–8 640 of 9 216 pixels |
+| Orb | blank-window control | a mapped, `IsViewable`, never-drawn window measures **1 colour / alpha 0** and is rejected by the same assertion |
 | Orb | per-mood renders | `orb-listening.png` (hue 87, sat 89), `orb-speaking.png` (hue 243), `orb-muted.png` (sat 0), `orb-offline.png` (dim), `orb-working-thinking.png`, plus the right-click `menu-view.png` |
 | Orb | no compositor | logs `no compositor or no ARGB visual here, drawn opaque with its own shadow` and keeps drawing |
 | Audio | `./scripts/linux-audio-check` | exit 0, all checks pass |
