@@ -1,6 +1,8 @@
 import Foundation
 import HerdrVoiceCore
-import os
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// One realtime voice session: streams mic audio up, plays assistant audio, runs Herdr tools.
 /// All state is touched on the main queue except `sendRaw`, which URLSessionWebSocketTask allows from any thread.
@@ -127,7 +129,7 @@ final class Realtime {
         /// The last time the mic heard a speech-loud chunk (above the gate's opening level).
         var lastLoud = Date.distantPast
     }
-    private let micShared = OSAllocatedUnfairLock(initialState: MicShared())
+    private let micShared = Locked(MicShared())
     /// Closed on purpose because nobody was talking; any speech (or an agent report) reopens it.
     private(set) var dormant = false
     /// A reconnect is already scheduled by the backoff.
@@ -540,7 +542,7 @@ final class Realtime {
     }
 
     private func receive(_ task: URLSessionWebSocketTask) {
-        task.receive { [weak self] result in
+        WebSocketCompat.receive(task) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self, task === self.socket else { return }
                 switch result {
@@ -892,7 +894,7 @@ final class Realtime {
     private func sendRaw(_ obj: [String: Any]) {
         guard let socket, let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
         let id = connection
-        socket.send(.string(String(decoding: data, as: UTF8.self))) { [weak self] err in
+        WebSocketCompat.send(socket, .string(String(decoding: data, as: UTF8.self))) { [weak self] err in
             guard let err else { return }
             DispatchQueue.main.async {
                 // Failures on a socket that never came up, or has since been replaced, are already reported by

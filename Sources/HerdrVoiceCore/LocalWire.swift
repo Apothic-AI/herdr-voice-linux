@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 public struct ToolManifest: Equatable {
@@ -26,7 +25,7 @@ public extension HerdrTools {
         let names = definitions.compactMap { $0["name"] as? String }
         let data = (try? JSONSerialization.data(withJSONObject: definitions,
                                                 options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data()
-        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hex(data: data)
         return ToolManifest(
             profile: .init(name: definitions.count == 32 ? "shell32" : "base30",
                            count: definitions.count, digest: digest),

@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import Testing
 @testable import HerdrVoiceCore
@@ -119,6 +118,6 @@ private func json(_ objects: [[String: Any]]) -> String {
     ]]
     let data = try! JSONSerialization.data(withJSONObject: fixture, options: [.sortedKeys, .withoutEscapingSlashes])
     #expect(String(decoding: data, as: UTF8.self).contains("and/or patch/12 ~/dev/app"))
-    let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    let digest = SHA256.hex(data: data)
     #expect(digest == "aa1900e9b7b626caee2c5710d503b7f575eff8a3204b3150d030e7fc37bd2092")
 }

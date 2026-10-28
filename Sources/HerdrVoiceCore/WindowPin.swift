@@ -1,5 +1,3 @@
-import CoreGraphics
-
 /// Pure decisions for pinning the orb to the terminal window that shows Herdr. The app layer supplies the process
 /// tree and the window list; everything here is testable.
 public enum WindowPin {
@@ -9,12 +7,12 @@ public enum WindowPin {
         public let layer: Int
         /// nil when the window title can't be read (no Screen Recording access for the terminal).
         public let name: String?
-        /// Global display coordinates, origin at the top-left of the main display, as CGWindowList reports them.
-        public let frame: CGRect
+        /// Global display coordinates, origin at the top-left of the main display (or of the X screen).
+        public let frame: Rect
         /// False for windows that exist but aren't shown, e.g. an unselected terminal tab.
         public let isOnScreen: Bool
 
-        public init(number: Int, pid: Int32, layer: Int, name: String?, frame: CGRect, isOnScreen: Bool = true) {
+        public init(number: Int, pid: Int32, layer: Int, name: String?, frame: Rect, isOnScreen: Bool = true) {
             self.number = number
             self.pid = pid
             self.layer = layer

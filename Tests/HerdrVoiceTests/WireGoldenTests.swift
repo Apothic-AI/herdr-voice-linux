@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import Testing
 @testable import HerdrVoiceCore
@@ -8,7 +7,7 @@ import Testing
 
 private func sha(_ obj: [String: Any]) -> String {
     let data = try! JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
-    return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    return SHA256.hex(data: data)
 }
 
 @Test("setup message is byte-identical to the shipping build", arguments: [

@@ -1,6 +1,8 @@
 import Foundation
 import HerdrVoiceCore
-import Security
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// One owned Electron inference host. Its session token and optional brain key travel over stdin, never argv.
 final class LocalRuntime {
@@ -247,9 +249,11 @@ final class LocalRuntime {
     }
 
     private func randomToken() throws -> String {
-        var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-            throw RuntimeError.failed("Could not create Local OpenLive session token")
+        let bytes: [UInt8]
+        do {
+            bytes = try Random.bytes(32)
+        } catch {
+            throw RuntimeError.failed("Could not create Local OpenLive session token: \(error)")
         }
         return Data(bytes).base64EncodedString().replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")

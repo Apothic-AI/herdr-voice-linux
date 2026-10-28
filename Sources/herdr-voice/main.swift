@@ -1,4 +1,4 @@
-import AppKit
+import Foundation
 import HerdrVoiceCore
 
 // ponytail: Swift 5 language mode with main-queue confinement instead of actors; move to Swift 6 strict
@@ -97,17 +97,9 @@ if args.count > 1, args[1] == "tool" {
     exit(0)
 }
 
-// Whatever was in front when we were launched: normally the terminal running Herdr.
-let launchedFrom = NSWorkspace.shared.frontmostApplication
-let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
-// An accessory app can still be activated at launch; it then holds focus with no window to type into, so
-// keystrokes stop reaching the terminal (and the pinned orb hides). Hand focus straight back.
-DispatchQueue.main.async {
-    guard NSApp.isActive, let previous = launchedFrom, previous.processIdentifier != getpid() else { return }
-    NSApp.yieldActivation(to: previous)
-    previous.activate()
-}
+// Platform presentation: AppKit hands focus straight back to the terminal on macOS; on Linux there is no
+// activation policy and the orb never takes focus, so it does nothing.
+AppHost.prepareForLaunch()
 
 // --orb-demo: orb only, driven by the live mic, cycling moods every 4s. No network, no key.
 if args.contains("--orb-demo") {
@@ -135,7 +127,7 @@ if args.contains("--orb-demo") {
     do { try audio.start() } catch { log("✖ audio: \(error.localizedDescription)"); exit(1) }
     log("orb demo: talk to see it react; ctrl+c to quit")
     signal(SIGINT) { _ in exit(0) }
-    app.run()
+    AppHost.runMainLoop()
 }
 
 guard let provider = Provider(rawValue: providerName) else {
@@ -298,7 +290,7 @@ if provider == .local {
     }
 }
 signal(SIGINT) { _ in exit(0) }
-app.run()
+AppHost.runMainLoop()
 
 /// 220 Hz with a wandering pitch, amplitude-shaped into ~4 "syllables" a second, as base64 PCM16 24 kHz.
 func demoSpeech(seconds: Double) -> String {
