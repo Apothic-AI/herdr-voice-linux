@@ -1,0 +1,55 @@
+#!/bin/sh
+# Hard prerequisites for Local OpenLive, checked before anything expensive runs. Every failure here names the
+# remediation, because the alternative is an Electron timeout that says nothing about what is missing.
+#
+# Audio is reported, never required: the helper owns no microphone or speaker, so a headless box can still build,
+# check and run the strict inference probes.
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "${repo_root}/local-openlive"
+
+fail() { printf '%s\n' "local-openlive prerequisite: $1" >&2; exit 1; }
+
+# Minimums match local-openlive/package.json engines; pnpm-lock.yaml stays exact either way.
+node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' \
+  || fail "Node 22 or later is required (found $(node -v 2>/dev/null || echo none))"
+command -v pnpm >/dev/null 2>&1 || fail "pnpm is required: https://pnpm.io/installation"
+test "$(pnpm --version | cut -d. -f1)" -ge 10 || fail "pnpm 10 or later is required (found $(pnpm --version))"
+
+command -v ollama >/dev/null 2>&1 \
+  || fail "Ollama is required for the default local brain: https://ollama.com/download"
+node -e 'fetch("http://127.0.0.1:11434/api/version").then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))' \
+  || fail "Ollama is installed but not answering on 127.0.0.1:11434; start it (systemctl --user start ollama, or ollama serve)"
+
+if [ "$(uname -s)" = Linux ]; then
+  # Chromium reaches WebGPU through Vulkan on Linux and the helper opts into that backend itself. Without an
+  # installed ICD there is no adapter at all, so check the driver before blaming the models.
+  # Vulkan ICDs live under vulkan/icd.d in any XDG data directory. XDG_DATA_DIRS is colon-separated while IFS is
+  # not, so translate to newlines and iterate with a here-document (a pipe would lose found_icd in a subshell).
+  found_icd=""
+  icd_dirs=$(printf '%s\n' "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:${HOME}/.local/share" | tr ':' '\n')
+  while IFS= read -r dir; do
+    [ -n "${dir}" ] || continue
+    for json in "${dir}/vulkan/icd.d/"*.json; do
+      if [ -f "${json}" ]; then found_icd="${json}"; break; fi
+    done
+    [ -n "${found_icd}" ] && break
+  done <<EOF
+${icd_dirs}
+EOF
+  [ -n "${found_icd}" ] \
+    || fail "no Vulkan ICD found; install your GPU's Vulkan driver (nvidia-utils or mesa-vulkan-drivers) or Chromium cannot request a WebGPU adapter"
+  if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    fail "no display: Electron needs X11 or Wayland; on a headless box run this under xvfb-run -a"
+  fi
+  if [ -z "${XDG_RUNTIME_DIR:-}" ] || { [ ! -e "${XDG_RUNTIME_DIR}/pipewire-0" ] && [ ! -e "${XDG_RUNTIME_DIR}/pulse/native" ]; }; then
+    printf '%s\n' "local-openlive prerequisite: no PipeWire or PulseAudio socket; the helper needs none, but the live voice loop does" >&2
+  fi
+fi
+
+if [ "$(uname -s)" = Darwin ]; then
+  [ -n "${DISPLAY:-}" ] || true # macOS always has a window server; nothing to check here.
+fi
+
+printf '%s\n' "local-openlive prerequisites: ok ($(uname -s) $(uname -m), node $(node -v), pnpm $(pnpm --version))"
