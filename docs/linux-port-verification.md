@@ -178,3 +178,47 @@ dribble, two messages coalesced into one frame, the measured 4092/2381 signature
     ./scripts/linux-x11-check                # window tracking, hide/restore, polling rate, hotkeys, conflicts
     ./scripts/linux-voice-loop-check         # the full loop against the local protocol stub
     swift test                               # 200 tests
+
+## Measured results (final run on this machine)
+
+Run on 2026-10-28 against commit `f27af91` + the working tree, Debian 13 x86_64, X11 :1 under mutter, PipeWire,
+Swift 6.0.3. All audio was routed to a null sink (`PULSE_SINK=hv_null`) so nothing was audible.
+
+| Area | Check | Result |
+|---|---|---|
+| Package | `swift test` | **200 tests passed** (190 original + 10 for the frame reassembler) |
+| Package | `swift build -c release` | green |
+| Session loop | `./scripts/linux-voice-loop-check` | **19 passed, 0 failed** |
+| Session loop | mic audio on the wire | **162 frames / 155,520 bytes** of real microphone PCM16 |
+| Session loop | tool round trip | real `list_agents` output returned as `function_call_output` |
+| Session loop | Esc interrupt | 2 × `conversation.item.truncate` |
+| Session loop | decoding | **0** undecodable events after frame reassembly |
+| Orb | `xwininfo` on the app's own window | 96×96, `Override Redirect State: yes`, **32-bit ARGB visual, composited** |
+| Orb | frame rate | **60 fps active / 30 fps idle** (logged transitions) |
+| Orb | per-mood renders | `orb-listening.png` (hue 87, sat 89), `orb-speaking.png` (hue 243), `orb-muted.png` (sat 0), `orb-offline.png` (dim), `orb-working-thinking.png`, plus the right-click `menu-view.png` |
+| Orb | no compositor | logs `no compositor or no ARGB visual here, drawn opaque with its own shadow` and keeps drawing |
+| Audio | `./scripts/linux-audio-check` | exit 0, all checks pass |
+| Audio | echo cancellation | **29.4 dB** ERLE synthetic; **68.8 dB** on a real 700 Hz loopback (−17.1 → −85.9 dBFS) |
+| Audio | cost | **5.1%** of one core with capture + playback + canceller |
+| X11 | `./scripts/linux-x11-check` | **30 checks, 0 failures** |
+| X11 | host window discovery | found `0x680000a "vici: herdr-voice-linux"` via the `/proc` ppid walk to `gnome-terminal-server` |
+| X11 | tracking latency | published rect followed a window move in **3 ms** |
+| X11 | hotkeys | `ctrl+alt+m` fires the mute handler; Esc is grabbed only while speaking and released after; a second process reports the conflict instead of crashing |
+| X11 | operator safety | the check creates **nothing** on the real display (works on a throwaway `:99`) |
+| Local OpenLive | `./scripts/local-openlive-preflight` | prerequisites ok (Linux x86_64, node v22.23.3, pnpm 12.9.1) |
+| Local OpenLive | WebGPU | **blocked on this box**: Dawn reports `vkAllocateMemory failed with VK_ERROR_OUT_OF_DEVICE_MEMORY`, and the loader logs `dri_gbm.so: Permission denied`. The helper fails loudly rather than silently falling back to CPU. This is a driver/VRAM limit of this machine, not the port: the helper is the same Electron + WebGPU code the macOS build runs, and the Linux port's job was to make it start and fail honestly here. |
+
+### What is proven only to the protocol boundary
+
+No cloud provider key exists on this machine, so the Grok/OpenAI/Gemini path is proven by (a) the golden wire
+tests, which pin the exact JSON sent to each provider, and (b) a live session against a local server speaking the
+same OpenAI Realtime protocol (which xAI's Grok Voice also speaks). Replacing `HERDR_VOICE_URL` with a real
+provider endpoint is the only step that needs a key, and it is the same code path that was exercised here.
+
+### One Linux-only defect found and fixed along the way
+
+swift-corelibs-foundation builds the WebSocket handshake with `Connection: keep-alive`, which RFC 6455 forbids
+(it must be `Upgrade`) and strict servers reject outright; the session could not connect at all until
+`Provider.websocketHandshakeFix` sent the correct header pair. Its Linux WebSocket client also delivers text
+frames fragmented, which produced `undecodable event` floods until `TextFrames` reassembled complete JSON
+objects — covered by unit tests for splits inside strings, inside escapes and at brace boundaries.
