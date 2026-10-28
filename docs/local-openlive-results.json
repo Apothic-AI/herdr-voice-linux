@@ -1,24 +1,111 @@
 {
+  "schema": 2,
   "kind": "local-openlive-integrated-smoke",
-  "date": "2026-09-25",
-  "hardware": "Apple M4 Pro, 48 GB, WebGPU Metal 3",
   "sourceCommit": "849173cd1c8c17a95d600b17b428c301722bf5df",
-  "speech": {
-    "format": "fp32",
-    "offlineCacheEntries": 15,
-    "offlineCacheBytes": 512501553,
-    "offlineCacheDigest": "7579d5d49d4b465b4c83ada81a3977e093cf0fd4bdcb090bdd27406197b0f51a",
-    "offlineReadinessProbeMs": { "sttSilence": 121.8, "ttsShortPhrase": 234.1 }
-  },
-  "brain": { "endpoint": "loopback Ollama", "model": "qwen3.5:4b", "inferenceProbe": "passed" },
-  "strictToolSmoke": {
-    "runs": 1,
-    "fixture": "list-my-herdr-agents.wav",
-    "realSwiftTool": "list_agents",
-    "toolCalls": 1,
-    "commitToFirstNonSilentPCMProxyMs": 9645.5,
-    "physicalSpeakerOnset": "not measured",
-    "cloudComparable": false,
-    "targetUnder500ms": false
-  }
+  "targetUnder500ms": false,
+  "runs": [
+    {
+      "platform": "macOS",
+      "date": "2026-09-25",
+      "hardware": "Apple M4 Pro, 48 GB, WebGPU Metal 3",
+      "speech": {
+        "format": "fp32",
+        "offlineCacheEntries": 15,
+        "offlineCacheBytes": 512501553,
+        "offlineCacheDigest": "7579d5d49d4b465b4c83ada81a3977e093cf0fd4bdcb090bdd27406197b0f51a",
+        "offlineReadinessProbeMs": { "sttSilence": 121.8, "ttsShortPhrase": 234.1 }
+      },
+      "brain": { "endpoint": "loopback Ollama", "model": "qwen3.5:4b", "inferenceProbe": "passed" },
+      "strictToolSmoke": {
+        "runs": 1,
+        "fixture": "list-my-herdr-agents.wav",
+        "realSwiftTool": "list_agents",
+        "toolCalls": 1,
+        "commitToFirstNonSilentPCMProxyMs": 9645.5,
+        "physicalSpeakerOnset": "not measured",
+        "cloudComparable": false,
+        "targetUnder500ms": false
+      }
+    },
+    {
+      "platform": "Linux",
+      "date": "2026-10-28",
+      "hardware": {
+        "machine": "Linux 7.2.12-1-liquorix-amd64 x86_64",
+        "gpu": "NVIDIA GeForce RTX 4050 Laptop GPU, 6 GB",
+        "driver": "615.71.10",
+        "vulkan": "1.4.351",
+        "vulkanHeapBudgetBytes": 4872798208,
+        "display": "X11 :1"
+      },
+      "toolchain": {
+        "node": "22.23.3",
+        "pnpm": "12.9.1",
+        "pnpmLockfileVersion": "9.0",
+        "electron": "43.1.1",
+        "swift": "6.0.3"
+      },
+      "webgpu": {
+        "adapter": { "vendor": "nvidia", "architecture": "lovelace" },
+        "withoutHelperSwitch": "requestAdapter() resolved null; getGPUFeatureStatus reported webgpu: disabled_off",
+        "switch": "enable-features=Vulkan, appended by the helper (local-openlive/src/gpu.ts) before app readiness",
+        "deviceSmoke": "device created, storage buffer written through queue.writeBuffer",
+        "fallback": "none; startup still fails on a real adapter error"
+      },
+      "speech": {
+        "format": "fp32",
+        "offlineCacheEntries": 15,
+        "offlineCacheBytes": 512501553,
+        "offlineCacheDigest": "7579d5d49d4b465b4c83ada81a3977e093cf0fd4bdcb090bdd27406197b0f51a",
+        "digestMatchesMacOS": true,
+        "setupProbeMs": { "sttSilence": [218.3, 333.6], "ttsShortPhrase": [498.2, 438.3] },
+        "offlineRestartProbeMs": { "sttSilence": [296.7, 318.1, 329.4], "ttsShortPhrase": [410.9, 453.8, 416.0] }
+      },
+      "brain": {
+        "endpoint": "loopback Ollama 0.40.11 on 127.0.0.1:11434",
+        "model": "qwen3.5:4b",
+        "inferenceProbe": "passed",
+        "processor": "100% CPU (Ollama kept the model off the GPU, so the speech path owns the VRAM)"
+      },
+      "strictToolSmoke": {
+        "runs": 2,
+        "validRuns": 1,
+        "fixture": "list-my-herdr-agents.wav",
+        "realSwiftTool": "list_agents",
+        "toolCalls": 1,
+        "commitToFirstNonSilentPCMProxyMs": 6754.4,
+        "discardedRuns": [
+          {
+            "commitToFirstNonSilentPCMProxyMs": 175803.7,
+            "reason": "VRAM starvation dominated the run; not a latency sample"
+          }
+        ],
+        "vram": {
+          "totalMiB": 6141,
+          "peakUsedMiB": 5830,
+          "freeAtPeakMiB": 24,
+          "dawnErrors": 200,
+          "error": "vkAllocateMemory failed with VK_ERROR_OUT_OF_DEVICE_MEMORY while calling [Device].CreateBuffer"
+        },
+        "interpretation": "the run proves routing end to end (Whisper -> qwen3.5:4b -> real Swift list_agents -> Kokoro -> 2.8 MB WAV) but its proxy latency is inflated by Dawn retrying after exhaustion, so it is not a latency figure",
+        "physicalSpeakerOnset": "not measured",
+        "cloudComparable": false,
+        "targetUnder500ms": false
+      },
+      "commands": {
+        "pnpm install --frozen-lockfile": 0,
+        "pnpm build": 0,
+        "pnpm check": 0,
+        "pnpm test": 0,
+        "scripts/local-openlive-preflight": 0,
+        "scripts/local-openlive-setup": 0,
+        "scripts/local-openlive-check": 0,
+        "node scripts/setup-models.mjs": 0,
+        "node scripts/check-runtime.mjs": 0,
+        "scripts/local-openlive-demo": 0,
+        "swift build -c release": 0,
+        "ollama pull qwen3.5:4b": 0
+      }
+    }
+  ]
 }
