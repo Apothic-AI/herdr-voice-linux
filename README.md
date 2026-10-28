@@ -169,15 +169,19 @@ Then, in any Herdr pane:
    Switching keeps the conversation going with the new model. To change the voice itself (Rex, Eve, ...), set
    `HERDR_VOICE_VOICE` in the settings file below.
 
-4. **Give it a key** (optional), in Herdr's `config.toml`:
+4. **Give it a key** (optional), in Herdr's `config.toml` (`herdr server reload-config` applies it):
 
    ```toml
    [[keys.command]]
-   key = "prefix+v"
+   key = "prefix+m"
    type = "plugin_action"
    command = "brogrammermw.herdr-voice.start"
    description = "start herdr-voice"
    ```
+
+   Pick a key nothing else in your `config.toml` already binds: the file is a list of `[[keys.command]]` entries,
+   and a key you have already given to another plugin will not start the voice. `herdr config reset-keys` backs the
+   file up and clears the custom bindings if you need to start over.
 
 If your shell says `herdr-voice: command not found`, `~/.local/bin` isn't on your `PATH`: add
 `export PATH="$HOME/.local/bin:$PATH"` to your `~/.zshrc`.
@@ -185,7 +189,8 @@ If your shell says `herdr-voice: command not found`, `~/.local/bin` isn't on you
 **Settings** live in `config.env` in the plugin's config folder (`herdr plugin config-dir brogrammermw.herdr-voice`),
 created on first start with every option commented out. It takes the `HERDR_VOICE_*` settings from
 [Configuration](#configuration), one `NAME=value` per line; restart the voice to apply them. API keys are refused
-there on purpose: they belong in the Keychain.
+there on purpose: they belong in the platform secret store (the Keychain on macOS, the Secret Service or a
+private key file on Linux), never in a plain settings file.
 
 **Before you install,** know what it does (Herdr doesn't review plugins): it builds with `swift build`, listens to
 your microphone while unmuted, streams your speech to the AI provider you chose, reads your agents' terminals to
