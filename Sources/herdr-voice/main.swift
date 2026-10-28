@@ -206,7 +206,9 @@ func loadLocal(onFailure: @escaping (Error) -> Void) {
         }
     }
 }
-// A lost local connection means the helper crashed: relaunch it, backing off like any failed reconnect.
+// A lost local connection is redialed on the helper's port while the helper is alive; only a helper that is really
+// gone is relaunched (see Reconnect.relaunchesHelper). A second, slower failure backs off like any other reconnect.
+session.localHelperAlive = { localRuntime.isRunning }
 session.relaunchLocalHelper = {
     loadLocal { session.localRelaunchFailed("Local OpenLive relaunch failed: \($0.localizedDescription)") }
 }
@@ -252,6 +254,22 @@ let orb = Orb(onClick: { session.toggleMute() }, menuChoices: modelChoices, onQu
 })
 Hotkey.registerMute { session.toggleMute() }
 
+// A SIGTERM (a check, a closing pane, `pkill`) must take the helper down with it: an orphaned Electron host holds the
+// GPU and its model cache. The orb's quit path stops the same things, so both exits behave alike, and the sources
+// stay alive in `signalSources` where a signal cannot free one mid-handler.
+var signalSources: [DispatchSourceSignal] = []
+for sig in [SIGTERM, SIGINT, SIGHUP] {
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler {
+        session.shutdown()
+        localRuntime.stop()
+        exit(0)
+    }
+    source.resume()
+    signalSources.append(source)
+}
+
 // Pin the orb to the terminal window showing Herdr; HERDR_VOICE_ORB_PIN=0 keeps it in the screen corner.
 let windowTracker = WindowTracker()
 if env["HERDR_VOICE_ORB_PIN"] != "0" {
@@ -265,15 +283,30 @@ session.audio.onSpeakingChanged = { speaking in
     Hotkey.setStopKey(active: speaking) { session.stopSpeech(reason: "Esc") }
 }
 
+/// The orb's mood as of the last frame, so a change is logged once instead of once per frame.
+final class MoodTicker {
+    private var last: Mood?
+    func changed(to mood: Mood) -> Bool {
+        guard mood != last else { return false }
+        last = mood
+        return true
+    }
+}
+let moodTicker = MoodTicker()
+
 orb.run {
     let a = session.audio
     let loading = localActivation.loading
-    let mood = Activity.mood(loading: loading, disconnected: session.status == .disconnected,
+    // Anything but a live session is offline as far as the microphone is concerned: never show listening-blue while
+    // what is said has nowhere to go. Red while reconnecting, blue again the moment the session is back.
+    let live = session.status == .live
+    let mood = Activity.mood(loading: loading, disconnected: !live,
                              dormant: session.dormant, muted: session.muted, speaking: a.isSpeaking,
                              agentsWorking: !session.busyAgents.isEmpty, micQuiet: a.micLevel < 0.02)
+    if moodTicker.changed(to: mood) { log("◎ orb: \(mood)") }
     // Both directions at once: talking over the assistant shows your push and its core together.
     return Orb.Frame(mood: mood, mic: session.muted ? 0 : a.micLevel, voice: a.isSpeaking ? a.outLevel : 0,
-                     thinking: loading || (session.status != .disconnected && session.thinking))
+                     thinking: loading || (live && session.thinking))
 }
 
 do {

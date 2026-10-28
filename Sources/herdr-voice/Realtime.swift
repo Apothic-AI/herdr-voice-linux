@@ -97,7 +97,12 @@ final class Realtime {
     /// Agent reports that arrived while offline, delivered once the next session is up.
     private var outbox: [String] = []
     private var keepalive: DispatchSourceTimer?
-    private var pongPending = false
+    /// A keepalive is out and unanswered.
+    private var keepaliveOutstanding = false
+    /// Consecutive keepalive ticks that went unanswered. The socket is declared dead only on the second, so one slow
+    /// turn — the local pipeline answers in 269–376 ms, but a queued one can hold the reply longer — is not a death
+    /// sentence for the session.
+    private var keepaliveMisses = 0
 
     // Speech-gated streaming. Providers bill per minute of audio, and an always-open mic streams every unmuted
     // minute. Only speech is sent (SpeechGate), and a quiet session is closed and reopened when you next speak.
@@ -138,8 +143,19 @@ final class Realtime {
     /// A reconnect is already scheduled by the backoff.
     private var retryPending = false
     private(set) var providerPreparing = false
-    /// Local mode: the helper's connection was lost, so its port is dead and the next connect relaunches it.
+    /// Local mode: something more than a socket was lost — the helper process itself is gone, so the next connect
+    /// relaunches it. A socket that merely dropped is redialed on the same port (see `Reconnect.relaunchesHelper`).
     private var connectionLost = false
+    /// Relaunches since the last healthy session, so a host that dies again immediately is reported once instead of
+    /// respawned in a loop.
+    private var relaunches = 0
+    /// The failure that opened the current outage, so the log says it once per outage rather than once per retry.
+    private var outage: String?
+    /// The helper is being relaunched and reloading its models: the one case worth a word to the developer.
+    private var reloadingModels = false
+    /// Whether the Local OpenLive helper is still running. Absent means "assume it is": a missing answer then costs
+    /// a redial, not the ~9 s warm-up of a relaunch.
+    var localHelperAlive: (() -> Bool)?
     /// Relaunches the Local OpenLive helper off the main queue, then calls completeProviderSwitch with its new port,
     /// or localRelaunchFailed.
     var relaunchLocalHelper: (() -> Void)?
@@ -310,10 +326,20 @@ final class Realtime {
         guard !providerPreparing else { return }
         retryPending = false
         dormant = false
-        if Reconnect.relaunchesHelper(provider: provider, connectionLost: connectionLost), let relaunchLocalHelper {
+        if Reconnect.relaunchesHelper(provider: provider, connectionLost: connectionLost,
+                                      helperAlive: localHelperAlive?() ?? true),
+           let relaunchLocalHelper {
+            // A host that keeps dying is reported, not respawned forever: each relaunch reloads the models.
+            guard relaunches < Reconnect.maxRelaunches else {
+                status = .disconnected
+                log("✖ Local OpenLive keeps stopping; press \(Hotkey.label) to try again")
+                return
+            }
+            relaunches += 1
             connectionLost = false
             providerPreparing = true
             requestOverride = nil
+            reloadingModels = true
             log("↻ relaunching Local OpenLive")
             return relaunchLocalHelper()
         }
@@ -335,10 +361,9 @@ final class Realtime {
         let handle = wire.capabilities.nativeResumption ? resumeHandle : nil
         resumedWithContext = handle != nil
         send(.setup(instructions: voiceInstructions, voice: voice, resumeHandle: handle))
-        status = .live
-        if hadSession || attempts > 0 {
+        if provider != .local, hadSession || attempts > 0 {
             log("↻ reconnecting to \(provider.rawValue)")
-        } else {
+        } else if !hadSession {
             log("● connecting to \(provider.rawValue) — speak any time, \(Hotkey.label) mutes, Esc stops speech")
         }
         receive(task)
@@ -347,9 +372,22 @@ final class Realtime {
 
     /// The first server event on a socket: the session is really up.
     private func sessionEstablished() {
-        log(hadSession ? "↻ reconnected" : "● connected")
+        // Live only now, not when the socket merely opened: the orb shows offline until the session can actually carry
+        // a turn, so "listening" means the microphone has somewhere to go.
+        status = .live
         // Speech held while the session reopened goes first, before live audio starts flowing.
         let heardDuringHandshake = activateHeldAudio()
+        // A socket retry that worked is not news: the models stayed warm and it took about a second, so it says
+        // nothing at all. A relaunch is different — the models reload — and even then it is one short line, only for
+        // a developer who was in the middle of something.
+        if !hadSession {
+            log("● connected")
+        } else if reloadingModels, heardDuringHandshake || awaitingReplySince != nil || replies.callsInFlight > 0 {
+            log("… one moment, reloading the speech model")
+        }
+        reloadingModels = false
+        outage = nil
+        relaunches = 0
         established = true
         attempts = 0
         // A session resumed with its context (Gemini) already remembers the conversation.
@@ -403,12 +441,19 @@ final class Realtime {
     }
 
     private func scheduleRetry(reason: Reconnect.Reason, detail: String) {
-        guard let delay = Reconnect.delay(reason: reason, attempt: attempts, muted: muted) else {
+        guard let delay = Reconnect.delay(provider: provider, reason: reason, attempt: attempts, muted: muted) else {
             log(muted ? "… \(detail); reconnects when you unmute"
                       : "✖ \(detail); gave up after \(attempts) tries, press \(Hotkey.label) to reconnect")
             return
         }
-        log(delay == 0 ? "↻ \(detail)" : "↻ \(detail); reconnecting in \(Int(delay)) s")
+        // Once per outage, never once per attempt: a retry that lands inside a second is not news, and a repeated
+        // line reads like a failure loop even when the session has already recovered.
+        if outage == nil {
+            outage = detail
+            log(delay == 0 ? "↻ \(detail)"
+                : delay < 1 ? "↻ \(detail); reconnecting"
+                : "↻ \(detail); reconnecting in \(Int(delay)) s")
+        }
         let id = connection
         retryPending = true
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
@@ -417,29 +462,55 @@ final class Realtime {
         }
     }
 
-    /// Pings every 20 s. A failed ping, or no pong by the next one, means the socket is dead (sleep, network
-    /// change) even though no error surfaced, so reconnect instead of waiting forever.
+    /// Proves the socket is alive every 5 s, so one that died without an error (sleep, network change) is found.
+    ///
+    /// A transport ping cannot do that on Linux: swift-corelibs-foundation writes the ping frame but never calls the
+    /// pong handler, so a ping-based check would declare every live socket dead. The local helper answers a message
+    /// instead — from its own socket handler, never from a turn in flight — and only that answer counts.
+    ///
+    /// Two ticks may go unanswered before the socket is called dead. A single miss is not evidence: the GPU can be
+    /// mid-inference, and reconnecting on the first slow beat is what turned a warm session into a reconnect loop.
+    /// A missing answer still only costs a socket retry — never the inference host (see `Reconnect.relaunchesHelper`).
     private func startKeepalive(_ task: URLSessionWebSocketTask) {
         keepalive?.cancel()
-        pongPending = false
+        keepaliveOutstanding = false
+        keepaliveMisses = 0
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + 20, repeating: 20, leeway: .seconds(2))
+        timer.schedule(deadline: .now() + Self.keepaliveInterval, repeating: Self.keepaliveInterval,
+                       leeway: .seconds(1))
         timer.setEventHandler { [weak self, weak task] in
             guard let self, let task else { return }
-            if self.pongPending {
-                return self.connectionLost(task, reason: .dropped, detail: "no reply to keepalive")
-            }
-            self.pongPending = true
-            task.sendPing { error in
-                DispatchQueue.main.async {
-                    self.pongPending = false
-                    if let error { self.connectionLost(task, reason: .dropped, detail: "keepalive failed: \(error.localizedDescription)") }
+            guard self.provider == .local else {
+                // A cloud provider answers no application message, so a ping error is all there is: a real one means
+                // the socket died, while silence only means this platform never delivers the pong.
+                task.sendPing { [weak self] error in
+                    guard let error, let self else { return }
+                    DispatchQueue.main.async {
+                        guard task === self.socket else { return }
+                        self.connectionLost(task, reason: .dropped,
+                                            detail: "keepalive failed: \(error.localizedDescription)")
+                    }
                 }
+                return
             }
+            if self.keepaliveOutstanding {
+                self.keepaliveMisses += 1
+                if self.keepaliveMisses >= Self.keepaliveMissesAllowed {
+                    return self.connectionLost(task, reason: .dropped, detail: "no reply to keepalive")
+                }
+            } else {
+                self.keepaliveMisses = 0
+            }
+            self.keepaliveOutstanding = true
+            self.sendRaw(LocalWire.heartbeat)
         }
         timer.resume()
         keepalive = timer
     }
+
+    private static let keepaliveInterval: TimeInterval = 5
+    /// Unanswered ticks before the socket is called dead: about 10 s of silence, which no healthy local turn reaches.
+    private static let keepaliveMissesAllowed = 2
 
     /// Sends a conversation item that should get a spoken reply, or keeps it for the next session and makes sure
     /// one is coming: an agent report is worth reopening the session for, even while muted.
@@ -470,7 +541,10 @@ final class Realtime {
     }
 
     func toggleMute() {
-        if status == .disconnected {
+        // Muting is local and must keep working while the session is down: during an active recovery the key mutes,
+        // it is not swallowed as a retry. Only a settled outage keeps its "press to reconnect" meaning.
+        let recovering = retryPending || providerPreparing || status == .connecting
+        if status != .live && !recovering {
             // Offline while muted means we were waiting for you: unmute and reconnect in one press.
             if muted {
                 muted = false
@@ -585,6 +659,9 @@ final class Realtime {
         switch event {
         case .sessionReady:
             break
+        case .heartbeatAck:
+            keepaliveOutstanding = false
+            keepaliveMisses = 0
         case .audioDelta(let item, let b64):
             if !droppingAudio { enforce(policy.audio(base64Count: b64.utf8.count)) }
             if !droppingAudio { audio.play(base64: b64, item: item) }
