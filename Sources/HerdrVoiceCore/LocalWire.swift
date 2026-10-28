@@ -44,6 +44,12 @@ public final class LocalWire: Wire {
 
     public init() {}
 
+    /// The app's keepalive. A WebSocket pong never reaches the app on Linux — swift-corelibs-foundation writes the
+    /// ping but drops the pong callback — so socket liveness is measured with a message the helper has to answer.
+    public static let heartbeat: [String: Any] = ["type": "heartbeat"]
+    /// The helper's answer to `heartbeat`. Carries no epoch: it is about the socket, not about a turn.
+    public static let heartbeatAck = "heartbeat.ack"
+
     public func isCurrent(epoch candidate: Int) -> Bool {
         lock.withLock { candidate == epoch }
     }
@@ -113,6 +119,8 @@ public final class LocalWire: Wire {
         lock.lock()
         defer { lock.unlock() }
         if type == "session.updated" { return [.sessionReady] }
+        // Answered before the epoch guard: the keepalive is about the socket, so it carries no epoch.
+        if type == Self.heartbeatAck { return [.heartbeatAck] }
         if type == "error", object["epoch"] == nil { return [.error(Self.errorMessage(object, fallback: text))] }
         guard let eventEpoch = object["epoch"] as? Int, eventEpoch == epoch else { return [] }
 

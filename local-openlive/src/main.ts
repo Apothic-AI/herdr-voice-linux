@@ -13,6 +13,19 @@ import { migrateLegacyState, PARTITION, statePaths } from "./state.js";
 
 type BootConfig = { token: string; stateDir: string; setup?: boolean; brain?: BrainConfig };
 
+/**
+ * Test hook for the app's liveness policy: `LOCAL_OPENLIVE_FAULT_STALL_HEARTBEATS=<n>` swallows the next n keepalives,
+ * so a check can drop the socket without touching the inference host. Unset (0) in normal use.
+ */
+let droppedKeepalives = 0;
+function stallKeepalive(): boolean {
+  const budget = Number(process.env.LOCAL_OPENLIVE_FAULT_STALL_HEARTBEATS ?? 0);
+  if (!Number.isFinite(budget) || budget <= 0 || droppedKeepalives >= budget) return false;
+  droppedKeepalives += 1;
+  process.stderr.write(`local OpenLive: fault injection: dropped keepalive ${droppedKeepalives}/${budget}\n`);
+  return true;
+}
+
 // Must run before app readiness, and before the GPU process starts on window creation. Swift launches this
 // helper with a fixed argv, so the platform switch has to come from inside the helper.
 for (const { name, value } of gpuSwitches(process.platform, app.commandLine.getSwitchValue("enable-features"))) {
@@ -97,6 +110,13 @@ if (boot.setup) {
         if (binary || bytes > 2 * 1024 * 1024) throw new Error("text message required");
         const message = JSON.parse(raw.toString()) as WireMessage;
         if ("epoch" in message && Number.isSafeInteger(message.epoch)) epoch = message.epoch;
+        // Answered here, synchronously, and never through the bridge: a turn in flight (STT or TTS awaiting the GPU)
+        // must not be able to hold up the one message that proves the socket is alive. A late answer makes the app
+        // reconnect, so the answer deliberately depends on no promise at all.
+        if (message.type === "heartbeat") {
+          if (!stallKeepalive() && client.readyState === client.OPEN) client.send(JSON.stringify({ type: "heartbeat.ack" }));
+          return;
+        }
         await bridge.handle(message);
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);

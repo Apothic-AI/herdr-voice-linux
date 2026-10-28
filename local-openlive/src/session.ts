@@ -12,8 +12,7 @@ type SessionUpdate = {
 type ToolOutput = { call_id: string; name: string; output: string };
 
 export type WireMessage =
-  | { type: "session.update"; session: SessionUpdate }
-  | { type: "input.begin"; epoch: number; utterance_id: string }
+  | { type: "session.update"; session: SessionUpdate }  | { type: "input.begin"; epoch: number; utterance_id: string }
   | { type: "input.append"; epoch: number; utterance_id: string; audio: string }
   | { type: "input.commit"; epoch: number; utterance_id: string }
   | { type: "input.clear"; epoch: number }
@@ -21,7 +20,9 @@ export type WireMessage =
   | { type: "tool.outputs"; epoch: number; outputs: ToolOutput[] }
   | { type: "response.create"; epoch: number }
   | { type: "response.cancel"; epoch: number }
-  | { type: "response.truncate"; epoch: number; item_id: string; audio_end_ms: number };
+  | { type: "response.truncate"; epoch: number; item_id: string; audio_end_ms: number }
+  /** App keepalive. Answered with `heartbeat.ack`; see BridgeSession.handle. */
+  | { type: "heartbeat" };
 
 type SpeechResult = { audio: Float32Array; sampleRate: number };
 
