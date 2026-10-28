@@ -83,6 +83,29 @@ If the Electron child crashes mid-session, herdr-voice relaunches it and reconne
 conversation recap, in about 5 s on a warm model cache. A helper that keeps failing backs off like any lost connection
 (1, 2, 4 … 30 s) and gives up after 8 tries; ⌥⌘M or choosing Local from the orb then tries again.
 
+A dropped **socket** is not a dead **host**, and the difference is worth the warm models. The helper is a long-lived
+Electron process that takes several seconds to reload its models, and its loopback port stays valid for as long as it
+lives, so the two failures are handled differently:
+
+| Failure | What happens |
+|---|---|
+| The socket dropped, the helper is alive | Redial the same port: 0.2 s, 0.5 s, then 1 s apart, up to 6 tries. Warm models are kept, nothing is said, and the orb goes back to blue when the session is up |
+| The helper process is gone | Relaunch it (SIGTERM, then SIGKILL and a wait for exit if it ignores that), reload the models, and reconnect; two relaunches in a row is the limit, then it stops with one readable line |
+
+Only a host whose process is actually gone is relaunched (`Reconnect.relaunchesHelper`); a live host whose port stopped
+answering is retried and then reported, never silently replaced. That is the fix for a reconnect loop that ran in the
+window: every late keepalive used to relaunch the whole inference host, so one slow beat became a restart cycle.
+
+The keepalive is a `heartbeat` message the helper answers every 5 s, and the socket is only called dead after **two**
+consecutive misses — one slow turn is not evidence of anything. The helper answers from its own socket handler, never
+from a turn in flight, so a GPU that is busy transcribing or synthesising cannot make the socket look dead. A
+WebSocket ping could not do this job on Linux: swift-corelibs-foundation writes the ping frame but never calls the pong
+handler, so a ping-based check reports every live socket as dead.
+
+`scripts/local-keepalive-check` proves all of it against the real helper: it holds a quiet session for the keepalive
+window, stalls the helper's heartbeats to show a socket retry with no relaunch, kills the helper to show a relaunch
+with the orb red then blue, and checks that neither case leaves an Electron process behind.
+
 This version uses Electron's persistent Cache API for speech assets. The cache, Electron's other data, and the setup
 inventory live in a state directory outside the plugin folder, so a plugin update from `herdr plugin install` keeps
 them:

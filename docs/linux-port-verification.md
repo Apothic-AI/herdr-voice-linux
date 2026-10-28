@@ -170,6 +170,42 @@ remembered rather than read as a closing quote. It is a no-op on macOS, where me
 is pinned by 10 unit tests: split mid-string, mid-escape and at both brace boundaries, a seven-byte-at-a-time
 dribble, two messages coalesced into one frame, the measured 4092/2381 signature, and a reset between connections.
 
+### The reconnect loop this closed
+
+A session came up, printed `● connected`, and then cycled: `↻ no reply to keepalive; reconnecting in 1 s` followed by
+`↻ relaunching Local OpenLive`, ten times in one two-minute run.
+
+Two defects compounded. **The keepalive could never be answered on Linux.** The app pinged every 20 s and treated "no
+pong by the next tick" as death, but swift-corelibs-foundation writes the WebSocket ping frame and never calls the
+pong handler. A probe against a server that answers every ping (with `autoPong: false` plus an explicit `pong()`, so
+the reply is certainly written) shows the frames arriving at 5, 10 and 15 s while the client's `pongReceiveHandler`
+fired **not once** — so every live socket was declared dead on its second beat. **And one missed beat relaunched the
+whole inference host**, a fresh Electron process that reloads its models, so a single late keepalive became a restart
+cycle.
+
+The fix separates the two failures and makes the liveness check answerable:
+
+| Failure | Handling |
+|---|---|
+| Socket dropped, helper process alive | Redial the same port at 0.2 s, 0.5 s, 1 s (6 tries). Warm models kept, no log line, orb red then blue |
+| Helper process gone | Relaunch it once, reload the models, reconnect. Two relaunches in a row is the limit, then one readable line and stop |
+
+The keepalive is a `heartbeat` message every 5 s, answered from the helper's own socket handler — never from a turn in
+flight, so a busy GPU cannot make the socket look dead — and the socket is called dead only on the **second**
+consecutive miss. Cloud providers still get a WebSocket ping, but only its error counts there, never its silence. A
+lost socket also no longer loses what was said: the microphone is held for the outage and flushed when the session is
+back, and the recap re-establishes the conversation.
+
+Measured here with `scripts/local-keepalive-check`, which drives the real helper and the real WebGPU pipeline, silently
+(`PULSE_SINK=hv_null`, `DISPLAY=:1`):
+
+| Scenario | Result |
+|---|---|
+| Quiet session, 120 s | 10 PASS: one `● connected`, no reconnect, no relaunch, helper alive, socket still established |
+| Helper drops two keepalives (fault injection) | 16 PASS: the drop was noticed, the **same** helper pids survived (`3371296 3371311`), zero relaunches, one line for the miss, orb red then blue, keepalives resumed |
+| Helper killed with `SIGKILL` | 14 PASS: one relaunch, new pids (`3373115 3373130` → `3373463 3373477`), models reloaded, `● connected` still once, orb red then blue |
+| Quit after either case | no orphaned Electron process, no app left running |
+
 ## What is not proven
 
 - **No live cloud session.** No OpenAI, xAI or Gemini key exists on this box. What is proven is that the app speaks
@@ -251,6 +287,13 @@ provider endpoint is the only step that needs a key, and it is the same code pat
 4. **Fragmented WebSocket text frames.** swift-corelibs delivers text frames split, which produced an
    `undecodable event` flood until `TextFrames` reassembled complete JSON objects — covered by unit tests for
    splits inside strings, inside escapes and at brace boundaries.
+
+5. **Every late keepalive relaunched the whole inference host.** The liveness check used a WebSocket ping whose pong
+   never arrives on Linux (swift-corelibs writes the ping and drops the callback), so every live socket was declared
+   dead on its second beat — and a missed beat relaunched the inference host, giving a reconnect loop about every
+   20 s. Liveness is now an application-level `heartbeat` the helper answers synchronously: 5 s cadence, two misses
+   before death, and a 0.2/0.5/1 s socket retry that keeps the warm models. Only a helper process that is really gone
+   is relaunched, and neither path leaves an Electron process behind.
 
 An earlier run of the helper did fail with Dawn's `vkAllocateMemory failed with VK_ERROR_OUT_OF_DEVICE_MEMORY`.
 That turned out to be GPU contention while several Electron/Chromium processes were running at once, not a limit:

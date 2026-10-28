@@ -131,7 +131,8 @@ hybrid keyed-brain settings, failure behavior, demos, tool examples and benchmar
 
 **What to expect.** While the speech models load (about 20 seconds once cached, a few minutes the first time) the
 orb is amber with the thinking bubble; it turns blue when the voice is listening. If the speech helper crashes,
-herdr-voice relaunches it and reconnects on its own, in about 5 seconds. Local mode answers in roughly two
+herdr-voice relaunches it and reconnects on its own, in about 5 seconds; a connection that merely drops is redialed to
+the same helper without paying that warm-up again. Local mode answers in roughly two
 seconds after you stop talking, slower than Grok; it's the choice for privacy, working offline, and no per-minute
 audio fees, not for speed. The default brain is Qwen 3.5 4B; for better answers at some speed cost, set
 `HERDR_VOICE_LOCAL_BRAIN_MODEL=qwen3.5:9b` (after `ollama pull qwen3.5:9b`).
@@ -612,7 +613,7 @@ Want the details? Ask it to show you the agent's pane ("show me claude-2") and r
 
 ```bash
 swift build          # debug build
-swift test           # 190 tests: local mode (wire, state directory, warm-up, relaunch, menu), plugin config and single-instance lock, starting agents, pane reading and watching, workspace/tab/worktree management, key setup, events, wire protocols (golden OpenAI/Grok messages, Gemini Live), Herdr tools, focus, confirmations, injection gates, shell, speech policy, activity, window pinning, reconnect, keychain, speech gate, reply scheduling, report condensing, stop phrases, model menu
+swift test           # 203 tests: local mode (wire, state directory, warm-up, relaunch, menu), plugin config and single-instance lock, starting agents, pane reading and watching, workspace/tab/worktree management, key setup, events, wire protocols (golden OpenAI/Grok messages, Gemini Live), Herdr tools, focus, confirmations, injection gates, shell, speech policy, activity, window pinning, reconnect, keychain, speech gate, reply scheduling, report condensing, stop phrases, model menu
 swift build -c release
 herdr plugin link "$PWD"   # try your working copy as the plugin (link doesn't build: run swift build -c release first)
 ```
@@ -705,7 +706,8 @@ delta, the process scan (0.4 ms every 2 s), and `herdr` CLI calls (under 10 ms e
 | `herdr-voice: command not found` | Add `~/.local/bin` to your `PATH` (see [Quick start](#quick-start)), or run `.build/release/herdr-voice` from the clone |
 | A model is greyed out in the orb's menu | Local OpenLive isn't set up yet: run `scripts/local-openlive-setup`. Any other model has no key yet: `herdr-voice setup openai` or `herdr-voice setup gemini` in another terminal; the menu picks it up next time you open it |
 | `⚠ could not register ⌥⌘M` | Another app owns that shortcut. Set `HERDR_VOICE_HOTKEY_KEYCODE`, or click the orb to mute |
-| `↻ …reconnecting` in the log | Normal: the session ended (idle or time limit) or the network dropped; it reconnects by itself (1 → 30 s backoff) |
+| `↻ …reconnecting` in the log | Normal: the session ended (idle or time limit) or the network dropped; it reconnects by itself (1 → 30 s backoff). In Local mode a reconnect is silent unless the helper had to be relaunched |
+| The orb is red (offline) | The session is not live: reconnecting, or waiting for you to unmute. It turns blue again the moment the session is back |
 | `✖ …gave up after 8 tries` / red orb | Repeated failures, usually a wrong or revoked key or no network. Fix that, then press `⌥⌘M` |
 | `⚠ not inside a Herdr pane` | Start it from a Herdr pane so it controls the right session |
 | The voice hears itself | Echo cancellation needs the default input/output devices; use headphones if your speakers are very loud (and make sure `HERDR_VOICE_ECHO_CANCEL` isn't `0`) |
