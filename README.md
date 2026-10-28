@@ -5,7 +5,7 @@ I really like ChatGPT's voice agent and decided to create a version that would r
 
 **Talk to the coding agents in your [Herdr](https://herdr.dev) panes, and hear them talk back.**
 
-herdr-voice is a macOS plugin for Herdr. Local OpenLive or a realtime cloud model from xAI, OpenAI, or Google
+herdr-voice is a Herdr plugin for macOS and Linux. Local OpenLive or a realtime cloud model from xAI, OpenAI, or Google
 understands your speech. It hands the work to the Claude Code or Codex agent in a Herdr pane and tells you when the
 agent finishes or needs approval. A glowing orb in the corner of your screen shows who is talking.
 
@@ -70,9 +70,40 @@ voice: Done. 42 tests pass; it fixed a null check in the login handler.
 | | |
 |---|---|
 | macOS | 14 Sonoma or later (developed on macOS 26) |
-| Swift | 5.10 or later: Xcode, or the Xcode Command Line Tools (`xcode-select --install`) |
+| Linux | X11 (Wayland works through XWayland), with Swift, Xlib, Cairo and PortAudio — see [Linux](#linux) |
+| Swift | 5.10 or later: Xcode or the Command Line Tools on macOS; `swiftlang` on Linux |
 | Herdr | 0.9.0 or later |
 | Provider | Local OpenLive with WebGPU and Ollama, or an xAI, OpenAI, or Google API key |
+
+### Linux
+
+The orb, the microphone, the global hotkeys and the window pinning are implemented against X11, Cairo and PortAudio
+rather than AppKit, AVFoundation and Carbon. Everything else — the voice session, the Herdr tools, the confirmation
+gate, Local OpenLive — is the same code as on macOS.
+
+```bash
+# Debian/Ubuntu (Debian 13 ships Swift 6 as `swiftlang`)
+sudo apt install swiftlang libx11-dev libxrender-dev libcairo2-dev portaudio19-dev
+# Fedora: sudo dnf install swift-lang libX11-devel libXrender-devel cairo-devel portaudio-devel
+# Arch:   sudo pacman -S swift libx11 libxrender cairo portaudio
+
+herdr plugin install brogrammerMW/herdr-voice
+herdr-voice setup grok      # or: local, openai, gemini
+herdr-voice
+```
+
+What is different on Linux, and why:
+
+- **The mute hotkey is `Ctrl+Alt+M`** instead of `⌥⌘M` (there is no ⌥⌘ on Linux). Override it with
+  `HERDR_VOICE_HOTKEY_KEY` and `HERDR_VOICE_HOTKEY_MODS`. Esc is still grabbed only while the voice is speaking.
+- **API keys** go to the Secret Service (GNOME Keyring, KWallet) when one is reachable, and otherwise to a private
+  0600 file under `$XDG_CONFIG_HOME/herdr-voice/secrets`. `HERDR_VOICE_KEYRING` forces a backend.
+- **`run_shell`** runs in `$SHELL` rather than always `/bin/zsh`.
+- **Echo cancellation** uses the system's echo-cancel source when one exists and the app's own adaptive canceller
+  otherwise, so the mic can stay open while the voice speaks.
+
+The full port notes — what replaced what, and how each piece was verified — are in
+[docs/linux-port.md](docs/linux-port.md).
 
 ## Local OpenLive quick start
 
@@ -287,7 +318,7 @@ thing, the voice asks which one you mean instead of guessing.
 
 | Control | Action |
 |---|---|
-| `⌥⌘M`, or click the orb | Mute or unmute the mic, from any app. When disconnected, reconnects instead |
+| `⌥⌘M` on macOS, `Ctrl+Alt+M` on Linux, or click the orb | Mute or unmute the mic, from any app. When disconnected, reconnects instead |
 | Right-click (or control-click) the orb | Menu: **Show voice pane** unzooms the tab so the voice's transcript is in view; **Hide voice pane** zooms the pane above it again; the model entries switch the AI model (**Grok**, **GPT**, **Gemini**; the current one is checked, models without an API key are greyed out), which carries the conversation over to the new model, or **Quit herdr-voice**, which closes the provider session and exits |
 | `Esc` while the voice is talking | Stop it and cancel the rest of the reply |
 | Talk over the voice | Stop it and listen to you (only when your mic actually heard you, so echo and noise don't cut it off) |
@@ -301,8 +332,8 @@ use while muted.
 
 ### Where the orb shows
 
-The orb is pinned to the terminal window running Herdr (Terminal, iTerm, Ghostty, and so on), just inside its
-bottom-left corner, and follows it when you move or resize it. It **stays visible when you click into another app
+The orb is pinned to the terminal window running Herdr (Terminal, iTerm, Ghostty, gnome-terminal, and so on),
+just inside its bottom-left corner, and follows it when you move or resize it. It **stays visible when you click into another app
 or another window**: focus doesn't matter, it floats above them on the Herdr window's corner. It hides only when the
 Herdr window itself isn't shown:
 
