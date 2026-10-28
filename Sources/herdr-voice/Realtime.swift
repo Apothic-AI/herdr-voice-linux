@@ -17,6 +17,9 @@ final class Realtime {
     private var socket: URLSessionWebSocketTask?
     /// The provider's wire protocol for the current connection (see Wire). Replaced on every connect.
     private var wire: Wire
+    /// Reassembles messages that arrive split across several WebSocket frames (Linux delivers anything over ~4 KB in
+    /// pieces). Reset with the wire, so no fragment is ever stitched onto another connection.
+    private var frames = TextFrameAssembler()
     /// Gemini: resumes the previous session, context included, on the next connection.
     private var resumeHandle: String?
     /// Whether this connection resumed a session with its context (then no recap is needed).
@@ -320,6 +323,7 @@ final class Realtime {
         closeReason = nil
         status = .connecting
         wire = provider.makeWire()
+        frames.reset()
         let newWire = wire
         micShared.withLock { $0.wire = newWire }
         pendingOutputs.removeAll()
@@ -553,13 +557,16 @@ final class Realtime {
                     @unknown default: nil
                     }
                     if let text {
-                        let events = self.wire.decode(text)
-                        if self.debugEvents { self.logEvents(events) }
-                        if !self.established,
-                           self.provider != .local || events.contains(.sessionReady) {
-                            self.sessionEstablished()
+                        // Each fragment may be a message, part of one, or several: decode only what is complete.
+                        for message in self.frames.push(text) {
+                            let events = self.wire.decode(message)
+                            if self.debugEvents { self.logEvents(events) }
+                            if !self.established,
+                               self.provider != .local || events.contains(.sessionReady) {
+                                self.sessionEstablished()
+                            }
+                            events.forEach(self.handle)
                         }
-                        events.forEach(self.handle)
                     }
                     self.receive(task)
                 case .failure(let err):
