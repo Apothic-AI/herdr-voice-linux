@@ -88,6 +88,9 @@ final class OrbX11 {
     init?() {
         guard let display = XOpenDisplay(nil) else { return nil }
         self.display = display
+        // Before the first request goes out: Xlib's default is to drop a failing request in silence. The handler is
+        // per process, so installing it through the dlopen shim covers this connection as well.
+        if let api = X11API.shared { X11Errors.install(api.setErrorHandler) }
         screen = XDefaultScreen(display)
         root = XDefaultRootWindow(display)
         defaultDepth = XDefaultDepth(display, screen)
@@ -244,6 +247,9 @@ final class OrbX11Window {
     /// The obvious alternative — a Cairo xlib surface on the window — makes Cairo upload each frame through MIT-SHM,
     /// and every upload's `ShmCompletion` event wakes the frame thread, which draws again: a self-feeding loop that
     /// measured 1 300 fps. `XPutImage` is a plain copy, generates no events, and keeps the alpha channel exact.
+    ///
+    /// The `XImage` describes Cairo's own pixels rather than a buffer of its own: `XCreateImage` does **not** allocate
+    /// data for a NULL pointer, it hands back an image whose `data` is NULL, and `XPutImage` cannot blit one of those.
     private var gc: GC?
     private var ximage: UnsafeMutablePointer<XImage>?
     private var image: OpaquePointer?
@@ -277,8 +283,8 @@ final class OrbX11Window {
     }
 
     deinit {
+        discardImage()
         cairo_surface_destroy(image)
-        if let ximage { ximage.pointee.f.destroy_image(ximage) }
         if let gc { XFreeGC(x.display, gc) }
         XDestroyWindow(x.display, id)
     }
@@ -306,40 +312,49 @@ final class OrbX11Window {
             image = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height)
             imageWidth = width
             imageHeight = height
+            // The XImage borrows those pixels, so an image describing the surface that just went away is dangling.
+            discardImage()
         }
         if gc == nil { gc = XCreateGC(x.display, id, 0, nil) }
-        if ximage == nil {
+        if ximage == nil, let image, let pixels = cairo_image_surface_get_data(image) {
+            // The XImage is built over Cairo's pixels, with Cairo's stride as `bytes_per_line`.
+            //
+            // This is the part that has to be right, and it used to be wrong in a way nothing reported: asked for a
+            // NULL data pointer, `XCreateImage` allocates nothing and returns an image whose `data` is NULL, and
+            // `XPutImage` on that image transfers nothing at all. No error, no event, no pixels — a window that is
+            // `IsViewable` and blank. Borrowing Cairo's buffer fixes it and drops the per-frame copy with it.
+            //
             // 32 bits per pixel in every case: the ARGB32 image surface's own layout, and what a depth-24 visual on
             // this server reads as well (the padding byte is ignored).
-            ximage = XCreateImage(x.display, visual, UInt32(depth), 2 /* ZPixmap */, 0, nil, UInt32(width),
-                                  UInt32(height), 32, 0)
+            let stride = Int32(cairo_image_surface_get_stride(image))
+            ximage = XCreateImage(x.display, visual, UInt32(depth), 2 /* ZPixmap */, 0,
+                                  UnsafeMutableRawPointer(pixels).assumingMemoryBound(to: CChar.self),
+                                  UInt32(width), UInt32(height), 32, stride)
         }
     }
 
-    /// Paints one frame: `body` draws into a Cairo context over an ARGB32 image surface, then the pixels are put on
+    /// Drops the `XImage` without letting Xlib free what it was pointed at: those pixels belong to Cairo.
+    private func discardImage() {
+        guard let ximage else { return }
+        ximage.pointee.data = nil
+        ximage.pointee.f.destroy_image(ximage)
+        self.ximage = nil
+    }
+
+    /// Paints one frame: `body` draws into a Cairo context over an ARGB32 image surface, then those pixels are put on
     /// the window with `XPutImage`. Returns that image surface so a caller can also write it out as a PNG.
     @discardableResult
     func render(_ body: (OpaquePointer, Double, Double) -> Void) -> OpaquePointer? {
         makeSurfaces()
-        guard let image = image, let canvas = cairo_create(image), let gc, let ximage,
-              let destination = ximage.pointee.data
-        else { return nil }
+        guard let image, let canvas = cairo_create(image), let gc, let ximage else { return nil }
         body(canvas, Double(width), Double(height))
         cairo_destroy(canvas)
+        // The server reads the very bytes Cairo just drew, so they have to be written back first.
         cairo_surface_flush(image)
-        guard let source = cairo_image_surface_get_data(image) else { return nil }
-        let sourceStride = Int(cairo_image_surface_get_stride(image))
-        let destinationStride = Int(ximage.pointee.bytes_per_line)
-        if sourceStride == destinationStride {
-            memcpy(destination, source, sourceStride * Int(height))
-        } else {
-            let rowBytes = min(sourceStride, destinationStride)
-            for row in 0..<Int(height) {
-                memcpy(destination + row * destinationStride, source + row * sourceStride, rowBytes)
-            }
-        }
         XPutImage(x.display, id, gc, ximage, 0, 0, 0, 0, UInt32(width), UInt32(height))
-        XFlush(x.display)
+        // Synchronous on purpose: a present that fails is then reported by the error handler on this frame, instead of
+        // the failure arriving later on an unrelated request or never being forced off the connection at all.
+        XSync(x.display, 0)
         return image
     }
 
@@ -365,12 +380,11 @@ final class OrbX11Window {
         height = newHeight
         XResizeWindow(x.display, id, UInt32(newWidth), UInt32(newHeight))
         // The image and the XImage both carry the old size; both are rebuilt on the next frame.
+        discardImage()
         cairo_surface_destroy(image)
         image = nil
         imageWidth = 0
         imageHeight = 0
-        if let ximage { ximage.pointee.f.destroy_image(ximage) }
-        ximage = nil
     }
 
     func move(toX px: Int32, y py: Int32) {
