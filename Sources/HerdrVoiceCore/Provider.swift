@@ -7,7 +7,13 @@ public enum Provider: String, CaseIterable {
     case local, openai, grok, gemini
 
     public var url: URL {
-        switch self {
+        // HERDR_VOICE_URL points the session at another endpoint — a proxy, a self-hosted gateway, or the local
+        // stub the Linux port's end-to-end check drives. Unset, every provider uses its real endpoint.
+        if let override = ProcessInfo.processInfo.environment["HERDR_VOICE_URL"],
+           let url = URL(string: override), url.scheme != nil {
+            return url
+        }
+        return switch self {
         case .local: URL(string: "ws://127.0.0.1:1")!
         case .openai: URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1")!
         case .grok: URL(string: "wss://api.x.ai/v1/realtime?model=grok-voice-latest")!
