@@ -240,7 +240,7 @@ final class LocalRuntime {
             let service = kind == "keyed" ? (setting("KEYCHAIN") ?? "HERDR_LOCAL_BRAIN_API_KEY") : setting("KEYCHAIN")
             if let service, !service.isEmpty {
                 guard let key = Keychain.password(service: service) else {
-                    throw RuntimeError.failed("No key found in Keychain service \(service)")
+                    throw RuntimeError.failed("No key found in \(Keychain.storeDescription) service \(service)")
                 }
                 value["apiKey"] = key
             }

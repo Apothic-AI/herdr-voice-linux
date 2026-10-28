@@ -4,10 +4,22 @@ on:
   push:
     branches-ignore: [main, master]
 jobs:
-  swift:
+  swift-macos:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - run: swift test
+      - run: swift build -c release
+  swift-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@v2
+        with: { swift-version: "6.0" }
+      # The Linux halves of the app talk to X11, Cairo and PortAudio directly; the package's
+      # systemLibrary targets find them through pkg-config.
+      - run: sudo apt-get update && sudo apt-get install -y libx11-dev libxrender-dev libcairo2-dev portaudio19-dev
+      - run: swift build
       - run: swift test
       - run: swift build -c release
   local-openlive:
@@ -22,6 +34,23 @@ jobs:
       - run: pnpm install --frozen-lockfile
         working-directory: local-openlive
       - run: pnpm build # syncs the pinned OpenLive source into vendor/, which check and test import
+        working-directory: local-openlive
+      - run: pnpm check
+        working-directory: local-openlive
+      - run: pnpm test
+        working-directory: local-openlive
+  local-openlive-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.5.2 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22.22.3, cache: pnpm, cache-dependency-path: local-openlive/pnpm-lock.yaml }
+      - run: ./scripts/local-openlive-source
+      - run: pnpm install --frozen-lockfile
+        working-directory: local-openlive
+      - run: pnpm build
         working-directory: local-openlive
       - run: pnpm check
         working-directory: local-openlive

@@ -12,7 +12,7 @@ if let dir = ProcessInfo.processInfo.environment["HERDR_PLUGIN_CONFIG_DIR"] {
         for (key, value) in settings { setenv(key, value, 0) } // a real environment variable still wins
         if !rejected.isEmpty {
             log("⚠ \(PluginConfig.fileName): ignored \(rejected.joined(separator: ", ")) (only HERDR_VOICE_* settings; "
-                + "API keys go in the Keychain with herdr-voice setup)")
+                + "API keys go in the \(Keychain.storeDescription) with herdr-voice setup)")
         }
     } else {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -37,7 +37,7 @@ if args.count > 1 {
         herdr-voice --here             start it in this pane
         herdr-voice --provider NAME    use local, grok, openai or gemini (default: local once set up, else grok)
         herdr-voice stop               stop the running voice
-        herdr-voice setup [NAME]       store an API key in the Keychain
+        herdr-voice setup [NAME]       store an API key in the platform secret store
         herdr-voice install-command    put herdr-voice on your PATH (~/.local/bin)
         herdr-voice uninstall-command  undo install-command
         herdr-voice tool [NAME JSON]   run one of the voice's tools by hand
