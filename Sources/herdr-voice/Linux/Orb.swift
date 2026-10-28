@@ -182,7 +182,9 @@ final class Orb {
         self.window = window
         menu = OrbMenu(x: x)
         if alpha {
-            log("◎ orb: 96x96 override-redirect window on a 32-bit ARGB visual, composited")
+            // The window id is printed so a test can check this exact window with `xwininfo -id` instead of guessing at
+            // it by class name, which matches unrelated windows that happen to share a title.
+            log("◎ orb: 96x96 override-redirect window 0x\(String(window.id, radix: 16)) on a 32-bit ARGB visual, composited")
         } else {
             log("⚠ orb: no compositor or no ARGB visual here, so the orb is drawn opaque with its own shadow")
         }

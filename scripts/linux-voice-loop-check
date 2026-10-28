@@ -1,89 +1,191 @@
 #!/usr/bin/env bash
-# Proves the whole Linux voice loop against a local protocol stub: microphone in, wire out, playback in, the orb
+# Proves the whole Linux voice loop against a local protocol stub: microphone in, wire out, playback out, the orb
 # reacting, a real Herdr tool call, and an Esc interrupt. No cloud key is needed and nothing leaves the machine.
 #
 #   ./scripts/linux-voice-loop-check            # full run in a fresh Herdr pane
 #
-# Evidence lands in /tmp/voice-loop-evidence/: the stub's JSON report, the app's pane output, orb window
-# properties, and screenshots taken during playback.
+# Two things this script insists on, because both have bitten us:
+#   - playback is routed into a null sink (PULSE_SINK=hv_null), so a check is never audible on the operator's machine;
+#   - the mic streams continuously (HERDR_VOICE_STREAM=always), because normally the app only sends audio while its
+#     speech gate is open — on a silent machine that is nothing at all, and the wire behaviour is what is under test.
+#
+# Evidence lands in /tmp/voice-loop-evidence/: the stub's JSON report, its log, the app's pane output, the orb's
+# window properties, and a screenshot taken during playback.
 set -uo pipefail
 
 repo=${1:-$(cd "$(dirname "$0")/.." && pwd)}
 bin="$repo/.build/release/herdr-voice"
-evidence=/tmp/voice-loop-evidence
+evidence=${EVIDENCE:-/tmp/voice-loop-evidence}
 port=${PORT:-8787}
+sink=${SINK:-hv_null}
 pass=0
 fail=0
+tab=""
 mkdir -p "$evidence"
-rm -f "$evidence"/*.json "$evidence"/*.log "$evidence"/*.png "$evidence"/*.txt 2>/dev/null
+rm -f "$evidence"/*.json "$evidence"/*.log "$evidence"/*.png "$evidence"/*.txt "$evidence"/stub-ready 2>/dev/null
 
 say() { printf '%s\n' "$*"; }
 ok() { pass=$((pass + 1)); say "PASS  $*"; }
 no() { fail=$((fail + 1)); say "FAIL  $*"; }
 check() { if [ "$1" = "true" ]; then ok "$2"; else no "$2"; fi; }
 
+cleanup() {
+    [ -n "${stub_pid:-}" ] && kill "$stub_pid" 2>/dev/null
+    [ -n "$tab" ] && herdr tab close "$tab" >/dev/null 2>&1
+}
+trap cleanup EXIT
+
+# One field of the stub's report, which is rewritten as the conversation proceeds. Anything unreadable reads as 0, so
+# a poll loop keeps waiting instead of failing on a half-written file.
+report() {
+    python3 - "$evidence/stub.json" "$1" <<'PY' 2>/dev/null || echo 0
+import json, sys
+try:
+    r = json.load(open(sys.argv[1]))
+except Exception:
+    print(0); raise SystemExit
+field = sys.argv[2]
+print(len(r.get(field) or []) if field in ("tool_outputs", "truncates") else r.get(field, 0))
+PY
+}
+
+# await_report <field> <minimum> <tries>: the report is the only source of truth about what reached the wire.
+await_report() {
+    local field=$1 want=$2 tries=$3 value=0
+    for _ in $(seq 1 "$tries"); do
+        value=$(report "$field")
+        [ "${value:-0}" -ge "$want" ] && { echo "$value"; return 0; }
+        sleep 1
+    done
+    echo "${value:-0}"
+    return 1
+}
+
+say "== 0. a null sink, so nothing is ever audible =="
+if pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$sink"; then
+    ok "playback goes to the null sink $sink (silent)"
+else
+    pactl load-module module-null-sink sink_name="$sink" >/dev/null 2>&1 \
+        && ok "created the null sink $sink (silent)" \
+        || { no "could not create the null sink $sink"; exit 1; }
+fi
+
 [ -x "$bin" ] || { say "building release binary"; (cd "$repo" && swift build -c release) || exit 1; }
 
 say "== 1. protocol stub on 127.0.0.1:$port =="
-rm -f "$evidence/stub-ready"
 python3 "$repo/scripts/realtime-stub" --port "$port" --report "$evidence/stub.json" \
-    --ready-file "$evidence/stub-ready" --lifetime "${STUB_LIFETIME:-75}" --turn-after 25 --tool list_agents \
+    --ready-file "$evidence/stub-ready" --lifetime "${STUB_LIFETIME:-180}" --turn-after 25 --tool list_agents \
+    --greeting-seconds "${GREETING_SECONDS:-3}" --reply-seconds "${REPLY_SECONDS:-12}" \
     > "$evidence/stub.log" 2>&1 &
 stub_pid=$!
-trap 'kill $stub_pid 2>/dev/null' EXIT
 for _ in $(seq 1 100); do [ -f "$evidence/stub-ready" ] && break; sleep 0.1; done
 [ -f "$evidence/stub-ready" ] && ok "stub listening" || { no "stub did not start"; exit 1; }
 
 say "== 2. start the voice in its own Herdr tab, pointed at the stub =="
-tab=$(herdr tab create --cwd "$repo" --label voice-loop-check --no-focus 2>/dev/null)
-pane=$(printf '%s' "$tab" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
+created=$(herdr tab create --cwd "$repo" --label voice-loop-check --no-focus 2>/dev/null)
+pane=$(printf '%s' "$created" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])' 2>/dev/null)
+tab=$(printf '%s' "$created" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])' 2>/dev/null)
 [ -n "$pane" ] && ok "voice pane $pane created" || { no "could not create a Herdr tab"; exit 1; }
 
 # A dummy key is fine: the stub is the server, and it never authenticates.
-herdr pane run "$pane" "HERDR_VOICE_URL=ws://127.0.0.1:$port OPENAI_API_KEY=stub-key HERDR_VOICE_PROVIDER=openai $bin --provider openai --here" >/dev/null 2>&1
+herdr pane run "$pane" "PULSE_SINK=$sink HERDR_VOICE_STREAM=always HERDR_VOICE_URL=ws://127.0.0.1:$port OPENAI_API_KEY=stub-key $bin --provider openai --here" >/dev/null 2>&1
 
-say "== 3. let the loop run (greeting, mic audio, tool call, reply) =="
-frames_seen=0
-for _ in $(seq 1 120); do
-    python3 - "$evidence/stub.json" <<'PY' >/dev/null 2>&1 && frames_seen=1 && break
-import json, sys, pathlib
-PY
-    # The stub only writes its report at exit; watch its log for the audio count instead.
-    if grep -q '"audio_frames": [1-9]' "$evidence/stub.log" 2>/dev/null; then frames_seen=1; break; fi
-    sleep 1
-done
+say "== 3. the app connects and the microphone reaches the wire =="
+if connected=$(await_report connected 1 "${CONNECT_TIMEOUT:-40}"); then
+    ok "the app connected to the stub"
+else
+    no "the app never connected to ws://127.0.0.1:$port"
+    herdr pane read "$pane" --source recent --lines 60 > "$evidence/voice-pane.txt" 2>&1
+    say "---- app pane, last 40 lines ----"; tail -40 "$evidence/voice-pane.txt"
+    say "---- stub log ----"; tail -20 "$evidence/stub.log"
+    exit 1
+fi
+
+if frames=$(await_report audio_frames 1 30); then
+    ok "microphone audio reached the wire ($frames frames so far)"
+else
+    no "no microphone audio reached the wire"
+    herdr pane read "$pane" --source recent --lines 60 > "$evidence/voice-pane.txt" 2>&1
+    say "---- app pane, last 40 lines ----"; tail -40 "$evidence/voice-pane.txt"
+fi
 
 say "== 4. the orb =="
-orb_win=$(xdotool search --class herdr-voice 2>/dev/null | head -1)
-[ -z "$orb_win" ] && orb_win=$(xdotool search --name "herdr-voice" 2>/dev/null | head -1)
+# The app prints the window id it created. Searching by class or name instead matches unrelated windows that share the
+# title — a terminal running this very repo, for instance — and then checks the wrong window's properties.
+orb_win=""
+for _ in $(seq 1 20); do
+    herdr pane read "$pane" --source recent --lines 200 > "$evidence/voice-pane.txt" 2>&1
+    orb_win=$(grep -oE 'override-redirect window 0x[0-9a-f]+' "$evidence/voice-pane.txt" | head -1 | awk '{print $NF}')
+    [ -n "$orb_win" ] && break
+    sleep 0.5
+done
 if [ -n "$orb_win" ]; then
-    ok "orb window present ($orb_win)"
+    ok "the orb announced its window ($orb_win)"
     xwininfo -id "$orb_win" > "$evidence/orb-xwininfo.txt" 2>&1
     xprop -id "$orb_win" > "$evidence/orb-xprop.txt" 2>&1
-    grep -qi "override_redirect: yes" "$evidence/orb-xwininfo.txt" \
-        && ok "orb is override-redirect (unmanaged, always on top)" || no "orb is not override-redirect"
+    grep -qx "Override Redirect State: yes" <(grep 'Override Redirect State' "$evidence/orb-xwininfo.txt" | sed 's/^ *//') \
+        && ok "the orb window is override-redirect: unmanaged, always on top" \
+        || no "orb window $orb_win is not override-redirect ($(grep 'Override Redirect State' "$evidence/orb-xwininfo.txt" | sed 's/^ *//'))"
+    { grep -q "Width: 96$" "$evidence/orb-xwininfo.txt" && grep -q "Height: 96$" "$evidence/orb-xwininfo.txt"; } \
+        && ok "the orb window is 96x96" || no "orb window is not 96x96"
+    grep -q "Depth: 32" "$evidence/orb-xwininfo.txt" \
+        && ok "the orb window is on a 32-bit ARGB visual" || no "orb window is not 32-bit"
     if command -v import >/dev/null 2>&1; then
         import -window "$orb_win" "$evidence/orb-during-playback.png" 2>/dev/null \
             && ok "orb screenshot captured" || say "     (screenshot skipped)"
     fi
 else
-    no "no orb window found"
+    no "the app never announced an orb window"
 fi
 
 say "== 5. Esc interrupts the reply =="
-# Esc is grabbed only while the assistant is audible; press it while the stub is streaming audio.
-xdotool key Escape 2>/dev/null
-sleep 1
+# Esc is grabbed on the root window only while the assistant is audible, so it has to be pressed during the final
+# reply — after the tool result came back — not before it.
+streamed=0
+for _ in $(seq 1 60); do
+    grep -q "streaming final" "$evidence/stub.log" 2>/dev/null && { streamed=1; break; }
+    sleep 1
+done
+if [ "$streamed" -eq 1 ]; then
+    ok "the stub is streaming its final reply"
+    before=$(report truncates)
+    # Playback begins as the first delta arrives; the orb goes active when audio is actually being played, so wait for
+    # the app to say that, then give the first frames a moment to queue before interrupting.
+    for _ in $(seq 1 30); do
+        herdr pane read "$pane" --source recent --lines 200 2>/dev/null | grep -q "orb: active" && break
+        sleep 0.2
+    done
+    sleep 0.7
+    xdotool key --clearmodifiers Escape 2>/dev/null
+    if after=$(await_report truncates $((before + 1)) 15); then
+        ok "Esc sent conversation.item.truncate ($before → $after)"
+    else
+        no "Esc sent no conversation.item.truncate (still $after, was $before)"
+    fi
+    printf 'truncates_before=%s\ntruncates_after=%s\n' "$before" "$after" > "$evidence/esc.txt"
+else
+    no "the stub never streamed a reply, so Esc had nothing to interrupt"
+fi
 
 say "== 6. stop the voice and collect the stub report =="
 herdr pane send-keys "$pane" C-c >/dev/null 2>&1
-sleep 1
-herdr pane read "$pane" --source recent --lines 200 > "$evidence/voice-pane.txt" 2>&1
-kill $stub_pid 2>/dev/null
-wait $stub_pid 2>/dev/null
-herdr tab close "$(printf '%s' "$tab" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])')" >/dev/null 2>&1
+# The stub rewrites its report as it goes, so it survives being killed — but only if it got far enough to write once.
+if settled=$(await_report connected 1 10); then
+    ok "the stub's report is on disk ($(wc -c < "$evidence/stub.json" | tr -d ' ') bytes)"
+else
+    no "the stub left no readable report"
+fi
+herdr pane read "$pane" --source recent --lines 400 > "$evidence/voice-pane.txt" 2>&1
+kill "$stub_pid" 2>/dev/null
+wait "$stub_pid" 2>/dev/null
+stub_pid=""
 
-[ -f "$evidence/stub.json" ] || { no "stub wrote no report"; exit 1; }
+if [ ! -s "$evidence/stub.json" ]; then
+    no "the stub wrote no report"
+    say "---- app pane, last 40 lines ----"; tail -40 "$evidence/voice-pane.txt"
+    exit 1
+fi
+
 read -r connected audio_frames audio_bytes tool_calls truncates session_updates <<<"$(python3 - "$evidence/stub.json" <<'PY'
 import json, sys
 r = json.load(open(sys.argv[1]))
@@ -92,6 +194,9 @@ print(r.get("connected", 0), r.get("audio_frames", 0), r.get("audio_bytes", 0),
 PY
 )"
 
+# A decode failure in the app would mean the assembler let a fragment through, or dropped one.
+undecodable=$(grep -c "undecodable" "$evidence/voice-pane.txt" 2>/dev/null || true)
+
 say "== results =="
 [ "$connected" -ge 1 ] && ok "the app connected and opened a session" || no "the app never connected"
 [ "$session_updates" -ge 1 ] && ok "session.update sent (instructions + tools)" || no "no session.update"
@@ -99,7 +204,9 @@ say "== results =="
     || no "no microphone audio reached the wire"
 [ "$tool_calls" -ge 1 ] && ok "a real Herdr tool ran and its output went back ($tool_calls)" \
     || no "no tool output came back"
-[ "$truncates" -ge 1 ] && ok "Esc truncated the reply ($truncates)" || no "no truncate after Esc"
+[ "$truncates" -ge 1 ] && ok "an interrupt truncated the reply ($truncates)" || no "no truncate"
+[ "${undecodable:-0}" -eq 0 ] && ok "no undecodable events in the app log" \
+    || no "$undecodable undecodable events in the app log"
 
 say ""
 say "evidence in $evidence  ($pass passed, $fail failed)"
