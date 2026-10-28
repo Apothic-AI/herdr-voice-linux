@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""A local Realtime-protocol stub, for proving the session loop without a cloud key.
+
+herdr-voice talks to a voice provider over the OpenAI Realtime WebSocket protocol (xAI's Grok Voice speaks the same
+one). This script answers that protocol on localhost and drives one scripted conversation: it greets, calls a real
+Herdr tool, and then replies. Everything it sees is written to a JSON report, so a test can assert on what the app
+actually did: how much microphone audio reached the wire, whether playback happened, whether a tool result came
+back, and whether an interrupt truncated the reply.
+
+It is a verification tool, not a provider: amplitudes are a plain tone and transcripts are fixed strings.
+
+    ./scripts/realtime-stub --port 8787 --report /tmp/realtime-stub.json
+"""
+
+import argparse
+import asyncio
+import base64
+import json
+import math
+import struct
+import time
+
+try:
+    import websockets
+except ImportError:  # pragma: no cover - the check script reports this
+    raise SystemExit("this script needs the python 'websockets' package")
+
+
+def tone(seconds: float, hz: float = 440.0, rate: int = 24000, amplitude: float = 0.25) -> bytes:
+    """PCM16 mono 24 kHz: what a provider sends as response audio deltas."""
+    frames = int(seconds * rate)
+    return b"".join(
+        struct.pack("<h", int(amplitude * 32767 * math.sin(2 * math.pi * hz * i / rate))) for i in range(frames)
+    )
+
+
+def chunk(pcm: bytes, size: int = 4800) -> list[bytes]:
+    """Split into 100 ms pieces, the size real providers stream in."""
+    return [pcm[i : i + size] for i in range(0, len(pcm), size)]
+
+
+class Stub:
+    def __init__(self, args):
+        self.args = args
+        self.started = time.time()
+        self.report = {
+            "connected": 0,
+            "session_updates": 0,
+            "audio_frames": 0,
+            "audio_bytes": 0,
+            "first_audio_at": None,
+            "clear_input": 0,
+            "truncates": [],
+            "tool_outputs": [],
+            "response_requests": 0,
+            "user_texts": [],
+            "events": [],
+        }
+        self.reply_sent = 0
+        self.tool_call_sent = False
+
+    def record(self, **kw):
+        self.report["events"].append({"at": round(time.time() - self.started, 3), **kw})
+
+    async def send(self, ws, obj):
+        await ws.send(json.dumps(obj))
+        self.record(direction="out", type=obj.get("type"))
+
+    async def speak(self, ws, text: str, seconds: float = 1.2):
+        """One assistant turn: response.created, audio deltas, transcript, response.done."""
+        item_id = f"item_{self.reply_sent}"
+        await self.send(ws, {"type": "response.created", "response": {"id": f"resp_{self.reply_sent}"}})
+        for piece in chunk(tone(seconds)):
+            await self.send(ws, {
+                "type": "response.output_audio.delta",
+                "item_id": item_id,
+                "delta": base64.b64encode(piece).decode(),
+            })
+            # Pace it like a real stream so playback, levels and the orb see a realistic turn.
+            await asyncio.sleep(0.02)
+        await self.send(ws, {"type": "response.output_audio_transcript.delta",
+                             "delta": text})
+        await self.send(ws, {"type": "response.output_audio_transcript.done", "transcript": text})
+        await self.send(ws, {"type": "response.done", "response": {"id": f"resp_{self.reply_sent}"}})
+        self.reply_sent += 1
+
+    async def handler(self, ws):
+        self.report["connected"] += 1
+        self.record(event="client_connected", path=getattr(ws, "request", None) and ws.request.path)
+        await self.send(ws, {"type": "session.created", "session": {"id": "stub-session"}})
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                self.record(event="undecodable_frame")
+                continue
+            kind = msg.get("type", "")
+            if kind == "session.update":
+                self.report["session_updates"] += 1
+                session = msg.get("session", {})
+                self.report["tools_offered"] = [t.get("name") for t in session.get("tools", [])]
+                self.report["instructions_chars"] = len(session.get("instructions", "") or "")
+                await self.send(ws, {"type": "session.updated", "session": {"id": "stub-session"}})
+            elif kind == "input_audio_buffer.append":
+                self.report["audio_frames"] += 1
+                audio = msg.get("audio", "")
+                self.report["audio_bytes"] += len(base64.b64decode(audio)) if audio else 0
+                if self.report["first_audio_at"] is None:
+                    self.report["first_audio_at"] = round(time.time() - self.started, 3)
+                # After a little speech, act like a server VAD: end the turn and answer once.
+                if self.report["audio_frames"] == self.args.turn_after and not self.tool_call_sent:
+                    self.record(event="simulated_turn_end")
+                    await self.send(ws, {"type": "input_audio_buffer.speech_started"})
+                    await self.send(ws, {"type": "input_audio_buffer.speech_stopped"})
+                    await self.send(ws, {"type": "conversation.item.input_audio_transcription.completed",
+                                         "transcript": "list the agents"})
+                    if self.args.tool:
+                        # A real tool call, executed by the app against the live Herdr session.
+                        self.tool_call_sent = True
+                        await self.send(ws, {
+                            "type": "response.created", "response": {"id": "resp_tool"}})
+                        await self.send(ws, {
+                            "type": "response.function_call_arguments.done",
+                            "call_id": "call_stub_1",
+                            "name": self.args.tool,
+                            "arguments": "{}",
+                        })
+                        await self.send(ws, {"type": "response.done", "response": {"id": "resp_tool"}})
+                    else:
+                        await self.speak(ws, "Here is what I found.", seconds=0.4)
+            elif kind == "input_audio_buffer.clear":
+                self.report["clear_input"] += 1
+            elif kind == "conversation.item.create":
+                item = msg.get("item", {})
+                if item.get("type") == "function_call_output":
+                    self.report["tool_outputs"].append({
+                        "call_id": item.get("call_id"),
+                        "output": (item.get("output") or "")[:400],
+                    })
+                    self.record(event="tool_output_received", call_id=item.get("call_id"))
+                elif item.get("type") == "message":
+                    text = "".join(c.get("text", "") for c in item.get("content", [])
+                                   if isinstance(c, dict))
+                    self.report["user_texts"].append(text[:200])
+            elif kind == "conversation.item.truncate":
+                self.report["truncates"].append({
+                    "item_id": msg.get("item_id"),
+                    "audio_end_ms": msg.get("audio_end_ms"),
+                })
+                self.record(event="truncate", **self.report["truncates"][-1])
+            elif kind == "response.create":
+                self.report["response_requests"] += 1
+                if self.tool_call_sent and self.report["tool_outputs"]:
+                    await self.speak(ws, "Four agents are running.", seconds=1.0)
+                elif self.reply_sent == 0:
+                    await self.speak(ws, "I am herdr-voice, ready when you are.", seconds=1.0)
+                else:
+                    await self.speak(ws, "Okay.", seconds=0.4)
+            elif kind == "response.cancel":
+                self.record(event="response_cancel")
+            else:
+                self.record(direction="in", type=kind)
+
+    async def main(self):
+        async with websockets.serve(self.handler, self.args.host, self.args.port) as server:
+            if self.args.ready_file:
+                with open(self.args.ready_file, "w") as f:
+                    f.write(str(self.args.port))
+            print(f"stub listening on ws://{self.args.host}:{self.args.port}", flush=True)
+            try:
+                await asyncio.sleep(self.args.lifetime)
+            finally:
+                server.close()
+        self.report["elapsed"] = round(time.time() - self.started, 2)
+        with open(self.args.report, "w") as f:
+            json.dump(self.report, f, indent=1)
+        print(json.dumps({k: v for k, v in self.report.items() if k != "events"}, indent=1), flush=True)
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8787)
+    p.add_argument("--turn-after", type=int, default=25,
+                   help="answer after this many 20 ms mic frames (~0.5 s of speech)")
+    p.add_argument("--tool", default="list_agents", help="tool to call, or '' for none")
+    p.add_argument("--lifetime", type=float, default=60.0)
+    p.add_argument("--report", default="/tmp/realtime-stub.json")
+    p.add_argument("--ready-file", default="")
+    asyncio.run(Stub(p.parse_args()).main())

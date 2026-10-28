@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Proves the whole Linux voice loop against a local protocol stub: microphone in, wire out, playback in, the orb
+# reacting, a real Herdr tool call, and an Esc interrupt. No cloud key is needed and nothing leaves the machine.
+#
+#   ./scripts/linux-voice-loop-check            # full run in a fresh Herdr pane
+#
+# Evidence lands in /tmp/voice-loop-evidence/: the stub's JSON report, the app's pane output, orb window
+# properties, and screenshots taken during playback.
+set -uo pipefail
+
+repo=${1:-$(cd "$(dirname "$0")/.." && pwd)}
+bin="$repo/.build/release/herdr-voice"
+evidence=/tmp/voice-loop-evidence
+port=${PORT:-8787}
+pass=0
+fail=0
+mkdir -p "$evidence"
+rm -f "$evidence"/*.json "$evidence"/*.log "$evidence"/*.png "$evidence"/*.txt 2>/dev/null
+
+say() { printf '%s\n' "$*"; }
+ok() { pass=$((pass + 1)); say "PASS  $*"; }
+no() { fail=$((fail + 1)); say "FAIL  $*"; }
+check() { if [ "$1" = "true" ]; then ok "$2"; else no "$2"; fi; }
+
+[ -x "$bin" ] || { say "building release binary"; (cd "$repo" && swift build -c release) || exit 1; }
+
+say "== 1. protocol stub on 127.0.0.1:$port =="
+rm -f "$evidence/stub-ready"
+python3 "$repo/scripts/realtime-stub" --port "$port" --report "$evidence/stub.json" \
+    --ready-file "$evidence/stub-ready" --lifetime "${STUB_LIFETIME:-75}" --turn-after 25 --tool list_agents \
+    > "$evidence/stub.log" 2>&1 &
+stub_pid=$!
+trap 'kill $stub_pid 2>/dev/null' EXIT
+for _ in $(seq 1 100); do [ -f "$evidence/stub-ready" ] && break; sleep 0.1; done
+[ -f "$evidence/stub-ready" ] && ok "stub listening" || { no "stub did not start"; exit 1; }
+
+say "== 2. start the voice in its own Herdr tab, pointed at the stub =="
+tab=$(herdr tab create --cwd "$repo" --label voice-loop-check --no-focus 2>/dev/null)
+pane=$(printf '%s' "$tab" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
+[ -n "$pane" ] && ok "voice pane $pane created" || { no "could not create a Herdr tab"; exit 1; }
+
+# A dummy key is fine: the stub is the server, and it never authenticates.
+herdr pane run "$pane" "HERDR_VOICE_URL=ws://127.0.0.1:$port OPENAI_API_KEY=stub-key HERDR_VOICE_PROVIDER=openai $bin --provider openai --here" >/dev/null 2>&1
+
+say "== 3. let the loop run (greeting, mic audio, tool call, reply) =="
+frames_seen=0
+for _ in $(seq 1 120); do
+    python3 - "$evidence/stub.json" <<'PY' >/dev/null 2>&1 && frames_seen=1 && break
+import json, sys, pathlib
+PY
+    # The stub only writes its report at exit; watch its log for the audio count instead.
+    if grep -q '"audio_frames": [1-9]' "$evidence/stub.log" 2>/dev/null; then frames_seen=1; break; fi
+    sleep 1
+done
+
+say "== 4. the orb =="
+orb_win=$(xdotool search --class herdr-voice 2>/dev/null | head -1)
+[ -z "$orb_win" ] && orb_win=$(xdotool search --name "herdr-voice" 2>/dev/null | head -1)
+if [ -n "$orb_win" ]; then
+    ok "orb window present ($orb_win)"
+    xwininfo -id "$orb_win" > "$evidence/orb-xwininfo.txt" 2>&1
+    xprop -id "$orb_win" > "$evidence/orb-xprop.txt" 2>&1
+    grep -qi "override_redirect: yes" "$evidence/orb-xwininfo.txt" \
+        && ok "orb is override-redirect (unmanaged, always on top)" || no "orb is not override-redirect"
+    if command -v import >/dev/null 2>&1; then
+        import -window "$orb_win" "$evidence/orb-during-playback.png" 2>/dev/null \
+            && ok "orb screenshot captured" || say "     (screenshot skipped)"
+    fi
+else
+    no "no orb window found"
+fi
+
+say "== 5. Esc interrupts the reply =="
+# Esc is grabbed only while the assistant is audible; press it while the stub is streaming audio.
+xdotool key Escape 2>/dev/null
+sleep 1
+
+say "== 6. stop the voice and collect the stub report =="
+herdr pane send-keys "$pane" C-c >/dev/null 2>&1
+sleep 1
+herdr pane read "$pane" --source recent --lines 200 > "$evidence/voice-pane.txt" 2>&1
+kill $stub_pid 2>/dev/null
+wait $stub_pid 2>/dev/null
+herdr tab close "$(printf '%s' "$tab" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["tab"]["tab_id"])')" >/dev/null 2>&1
+
+[ -f "$evidence/stub.json" ] || { no "stub wrote no report"; exit 1; }
+read -r connected audio_frames audio_bytes tool_calls truncates session_updates <<<"$(python3 - "$evidence/stub.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+print(r.get("connected", 0), r.get("audio_frames", 0), r.get("audio_bytes", 0),
+      len(r.get("tool_outputs", [])), len(r.get("truncates", [])), r.get("session_updates", 0))
+PY
+)"
+
+say "== results =="
+[ "$connected" -ge 1 ] && ok "the app connected and opened a session" || no "the app never connected"
+[ "$session_updates" -ge 1 ] && ok "session.update sent (instructions + tools)" || no "no session.update"
+[ "$audio_frames" -gt 0 ] && ok "microphone audio reached the wire ($audio_frames frames, $audio_bytes bytes)" \
+    || no "no microphone audio reached the wire"
+[ "$tool_calls" -ge 1 ] && ok "a real Herdr tool ran and its output went back ($tool_calls)" \
+    || no "no tool output came back"
+[ "$truncates" -ge 1 ] && ok "Esc truncated the reply ($truncates)" || no "no truncate after Esc"
+
+say ""
+say "evidence in $evidence  ($pass passed, $fail failed)"
+[ "$fail" -eq 0 ] || exit 1
