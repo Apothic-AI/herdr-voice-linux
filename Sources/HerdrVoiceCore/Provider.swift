@@ -71,7 +71,7 @@ public enum Provider: String, CaseIterable {
     /// swift-corelibs-foundation builds the WebSocket handshake with `Connection: keep-alive`, which RFC 6455
     /// forbids (it must be `Upgrade`) and strict servers reject outright. Sending the correct pair ourselves is
     /// enough: the header survives into the request URLSession makes.
-    func websocketHandshakeFix(_ request: URLRequest) -> URLRequest {
+    public static func websocketHandshakeFix(_ request: URLRequest) -> URLRequest {
         #if canImport(Darwin)
         return request
         #else
@@ -89,15 +89,15 @@ public enum Provider: String, CaseIterable {
         case .local:
             var request = URLRequest(url: url)
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            return websocketHandshakeFix(request)
+            return Self.websocketHandshakeFix(request)
         case .openai, .grok:
             var request = URLRequest(url: url)
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            return websocketHandshakeFix(request)
+            return Self.websocketHandshakeFix(request)
         case .gemini:
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
             components.queryItems = [URLQueryItem(name: "key", value: key)]
-            return websocketHandshakeFix(URLRequest(url: components.url!))
+            return Self.websocketHandshakeFix(URLRequest(url: components.url!))
         }
     }
 

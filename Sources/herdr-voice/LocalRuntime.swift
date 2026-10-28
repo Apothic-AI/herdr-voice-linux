@@ -46,7 +46,15 @@ final class LocalRuntime {
         child.executableURL = URL(fileURLWithPath: electron)
         child.arguments = [main]
         var childEnvironment: [String: String] = [:]
-        for key in ["HOME", "TMPDIR", "PATH", "LANG", "LC_ALL", "USER", "LOGNAME", "XDG_CACHE_HOME"] {
+        // Electron is a GUI process. On macOS it needs nothing from the environment to come up; on Linux it
+        // needs the display, the X authority and the session bus, or it exits with "Missing X server or $DISPLAY".
+        // The list stays narrow on purpose: this child is a sandboxed inference host, not a shell.
+        #if os(Linux)
+        let platformKeys = ["DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
+        #else
+        let platformKeys: [String] = []
+        #endif
+        for key in ["HOME", "TMPDIR", "PATH", "LANG", "LC_ALL", "USER", "LOGNAME", "XDG_CACHE_HOME"] + platformKeys {
             if let value = environment[key] { childEnvironment[key] = value }
         }
         childEnvironment["OLLAMA_NO_CLOUD"] = "1"
@@ -132,6 +140,9 @@ final class LocalRuntime {
         }
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        // The helper is a Node server: it only sees an upgrade if the handshake asks for one. Same fix the cloud
+        // providers get — without it the request arrives as a plain GET and the helper answers 404.
+        request = Provider.websocketHandshakeFix(request)
         return Ready(request: request, label: label, probe: object["probe"] as? [String: Any] ?? [:])
     }
 

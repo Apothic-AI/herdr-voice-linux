@@ -206,7 +206,10 @@ Swift 6.0.3. All audio was routed to a null sink (`PULSE_SINK=hv_null`) so nothi
 | X11 | hotkeys | `ctrl+alt+m` fires the mute handler; Esc is grabbed only while speaking and released after; a second process reports the conflict instead of crashing |
 | X11 | operator safety | the check creates **nothing** on the real display (works on a throwaway `:99`) |
 | Local OpenLive | `./scripts/local-openlive-preflight` | prerequisites ok (Linux x86_64, node v22.23.3, pnpm 12.9.1) |
-| Local OpenLive | WebGPU | **blocked on this box**: Dawn reports `vkAllocateMemory failed with VK_ERROR_OUT_OF_DEVICE_MEMORY`, and the loader logs `dri_gbm.so: Permission denied`. The helper fails loudly rather than silently falling back to CPU. This is a driver/VRAM limit of this machine, not the port: the helper is the same Electron + WebGPU code the macOS build runs, and the Linux port's job was to make it start and fail honestly here. |
+| Local OpenLive | `./scripts/local-openlive-check` | exit 0 — **44 helper tests pass**, report `status: ready-offline` |
+| Local OpenLive | WebGPU adapter | **`"webgpu": true`, NVidia / `lovelace`** (`RTX 4050 Laptop`, 6 GB; `maxBufferSize` 4 GB, a 1 GB buffer allocates cleanly) |
+| Local OpenLive | speech, through WebGPU | **STT probe 269 ms, TTS probe 376 ms**; Ollama brain `qwen3.5:4b` `inference: "ok"`; model inventory 15 files / 488 MB |
+| Local OpenLive | in the app | `◌ loading Local OpenLive WebGPU speech models` → `● Local OpenLive / qwen3.5:4b ready` → `● connected` over the authenticated loopback wire |
 
 ### What is proven only to the protocol boundary
 
@@ -215,10 +218,25 @@ tests, which pin the exact JSON sent to each provider, and (b) a live session ag
 same OpenAI Realtime protocol (which xAI's Grok Voice also speaks). Replacing `HERDR_VOICE_URL` with a real
 provider endpoint is the only step that needs a key, and it is the same code path that was exercised here.
 
-### One Linux-only defect found and fixed along the way
+### Linux-only defects found and fixed along the way
 
-swift-corelibs-foundation builds the WebSocket handshake with `Connection: keep-alive`, which RFC 6455 forbids
-(it must be `Upgrade`) and strict servers reject outright; the session could not connect at all until
-`Provider.websocketHandshakeFix` sent the correct header pair. Its Linux WebSocket client also delivers text
-frames fragmented, which produced `undecodable event` floods until `TextFrames` reassembled complete JSON
-objects — covered by unit tests for splits inside strings, inside escapes and at brace boundaries.
+1. **The WebSocket handshake was malformed.** swift-corelibs-foundation builds it with `Connection: keep-alive`,
+   which RFC 6455 forbids (it must be `Upgrade`) and strict servers reject outright; no provider connection could
+   be established until `Provider.websocketHandshakeFix` sent the correct header pair.
+2. **The same fix was missing on the Local OpenLive wire.** `LocalRuntime` builds its own `URLRequest` for the
+   helper, so it bypassed that fix: the request arrived as a plain `GET`, the helper's router answered **404**, and
+   the session looped on `Refused WebSockets upgrade: 404`. Applying the handshake fix there too is what turns
+   `● ready` into `● connected`.
+3. **The helper was launched without a display.** `LocalRuntime` passes a deliberately narrow environment to the
+   Electron child; on macOS that is enough, on Linux Electron exited with `Missing X server or $DISPLAY` and the
+   app reported `Local OpenLive exited during startup (status 1)`. `DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY`,
+   `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` now pass through on Linux only.
+4. **Fragmented WebSocket text frames.** swift-corelibs delivers text frames split, which produced an
+   `undecodable event` flood until `TextFrames` reassembled complete JSON objects — covered by unit tests for
+   splits inside strings, inside escapes and at brace boundaries.
+
+An earlier run of the helper did fail with Dawn's `vkAllocateMemory failed with VK_ERROR_OUT_OF_DEVICE_MEMORY`.
+That turned out to be GPU contention while several Electron/Chromium processes were running at once, not a limit:
+on a quiet GPU the same code takes the NVIDIA adapter and allocates a gigabyte without complaint. The
+`MESA-LOADER ... dri_gbm.so: Permission denied` line still appears on successful runs and is benign noise from the
+loader's fallback path.
