@@ -726,23 +726,35 @@ final class Realtime {
             // Barge-in: talking over the assistant cuts its audio; the server VAD handles the rest. The provider also
             // hears the voice's own echo and noise as speech, so only cut when this mic heard a loud onset too.
             let heard = !gated || micShared.withLock { Date().timeIntervalSince($0.lastLoud) < Self.bargeInWindow }
-            let continuesTurn = Date().timeIntervalSince(previousStart) < Self.onsetCoalesceWindow
+            // A turn is in progress until its reply has finished: being asked for, being generated, or still playing.
+            // An onset that lands in that window is either the developer interrupting a voice they can hear, or
+            // noise. It is never a second question - they have not heard the answer to the first yet.
+            let turnInProgress = overlapped || responseActive || awaitingCreated || awaitingReplySince != nil
+            let continuesTurn = turnInProgress || Date().timeIntervalSince(previousStart) < Self.onsetCoalesceWindow
             if debugEvents {
                 log("⋯ onset: heard=\(heard) gated=\(gated) speaking=\(overlapped) "
-                    + "responseActive=\(responseActive) continuing=\(continuesTurn) provider=\(provider.rawValue) muted=\(muted)")
+                    + "responseActive=\(responseActive) awaitingCreated=\(awaitingCreated) "
+                    + "turnInProgress=\(turnInProgress) continuing=\(continuesTurn) provider=\(provider.rawValue) muted=\(muted)")
             }
-            if provider == .local, !continuesTurn, heard || overlapped {
-                // Every local onset starts a new epoch and the bridge cancels everything older, heard or not, so
-                // no response.created/done or reply from before it will arrive; waiting on one would stall replies.
-                if responseActive { send(.cancelReply) }
-                replies.reset()
-                awaitingCreated = false
-                droppingAudio = overlapped
-            }
-            if heard, overlapped {
+            // Barge-in is the only thing that may cancel: it needs the developer to be talking over a voice they can
+            // actually hear. An onset while the model is still thinking (nothing audible yet) used to cancel the
+            // reply and start a new epoch, so TTS never produced a single frame - "it transcribed me and said
+            // nothing". Noise a second after they stopped talking did the same. Neither may cancel now.
+            if overlapped, heard {
+                if provider == .local {
+                    if responseActive { send(.cancelReply) }
+                    replies.reset()
+                    awaitingCreated = false
+                    droppingAudio = true
+                }
                 cutPlayback()
             } else if overlapped {
                 log("… kept talking: the mic didn't hear you (echo or noise)")
+            } else if provider == .local, !continuesTurn {
+                // A genuinely new question. The bridge starts a new epoch on any onset and drops anything older, so
+                // the bookkeeping is reset here; nothing is cancelled, because nothing was playing.
+                replies.reset()
+                awaitingCreated = false
             }
         case .functionCall(let callID, let name, let args):
             runTool(callID: callID, name: name, args: args, epoch: nil)
