@@ -63,6 +63,7 @@ final class PortAudio {
         var isFeedbackProne: Bool {
             let lower = name.lowercased()
             return lower.hasSuffix(".monitor") || lower.contains("monitor of") || lower.contains("aloop")
+                || lower.contains("loopback")
         }
     }
 
