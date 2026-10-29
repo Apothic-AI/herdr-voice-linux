@@ -46,6 +46,10 @@ cleanup() {
     [ -n "$app_pid" ] && kill "$app_pid" 2>/dev/null
     pkill -x herdr-voice 2>/dev/null
     pkill -f '[d]ist/main[.]mjs' 2>/dev/null
+    # Never leave the null sink behind: an orphaned module can outlive the run and, once its source disappears,
+    # PipeWire may re-point it at a real sink's own monitor - which is an endless feedback tone in the operator's
+    # headphones, not a theoretical risk (it happened).
+    [ -n "${sink_module:-}" ] && pactl unload-module "$sink_module" 2>/dev/null
     app_pid=""
     return 0
 }
@@ -80,7 +84,7 @@ say "== 0. a null sink, so a check is never audible =="
 if pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$sink"; then
     ok "playback goes to the null sink $sink (silent)"
 else
-    pactl load-module module-null-sink sink_name="$sink" >/dev/null 2>&1 \
+    sink_module=$(pactl load-module module-null-sink sink_name="$sink" 2>/dev/null) \
         && ok "created the null sink $sink (silent)" \
         || { no "could not create the null sink $sink"; exit 1; }
 fi
