@@ -76,6 +76,8 @@ final class Realtime {
     private var correctedLeak = false
     /// After a stop, audio still in flight for the cancelled response is dropped until the next response starts.
     private var droppingAudio = false
+    /// HERDR_VOICE_DEBUG_EVENTS: how many reply deltas a reply has lost, so a swallowed reply is visible in the log.
+    private var droppedDeltas = 0
 
     // Reconnecting. Providers close idle sessions (xAI after 15 minutes), networks drop, and a Mac that slept can
     // leave a dead socket behind, so the session is kept alive and renewed automatically.
@@ -112,6 +114,11 @@ final class Realtime {
     static let quietClose: TimeInterval = 180
     /// How recent the mic's own loud onset must be for the provider's "speech started" to cut the voice off.
     static let bargeInWindow: TimeInterval = 1.5
+    /// How close two gate onsets have to be to count as one utterance. The gate dips between words and on a breath,
+    /// and each re-open used to be handled as a brand-new turn: in local mode that sends `cancelReply` and starts a
+    /// new epoch, so it cancelled the reply the first onset had just asked for (a fraction of a second of speech,
+    /// then silence). One utterance is one turn.
+    static let onsetCoalesceWindow: TimeInterval = 1.2
     /// Mic-queue only. HERDR_VOICE_GATE_THRESHOLD pins the opening level for unusual hardware.
     private var gate = SpeechGate<String>(
         overrideThreshold: ProcessInfo.processInfo.environment["HERDR_VOICE_GATE_THRESHOLD"].flatMap(Float.init))
@@ -664,7 +671,14 @@ final class Realtime {
             keepaliveMisses = 0
         case .audioDelta(let item, let b64):
             if !droppingAudio { enforce(policy.audio(base64Count: b64.utf8.count)) }
-            if !droppingAudio { audio.play(base64: b64, item: item) }
+            if !droppingAudio {
+                audio.play(base64: b64, item: item)
+            } else if debugEvents {
+                droppedDeltas += 1
+                if droppedDeltas == 1 || droppedDeltas % 50 == 0 {
+                    log("⋯ dropped reply audio delta #\(droppedDeltas)")
+                }
+            }
         case .responseCreated:
             replies.responseCreated()
             awaitingCreated = false
@@ -703,24 +717,33 @@ final class Realtime {
             if !muted { awaitingReplySince = Date() }
             micShared.withLock { $0.midTurn = false }
         case .speechStarted:
-            speechOverlappedPlayback = audio.isSpeaking // before barge-in stops the playback below
+            let previousStart = lastSpeechStart
+            let overlapped = audio.isSpeaking // before barge-in stops the playback below
+            speechOverlappedPlayback = overlapped
             lastSpeechStart = Date()
             micShared.withLock { $0.midTurn = true }
             awaitingReplySince = nil
             // Barge-in: talking over the assistant cuts its audio; the server VAD handles the rest. The provider also
             // hears the voice's own echo and noise as speech, so only cut when this mic heard a loud onset too.
             let heard = !gated || micShared.withLock { Date().timeIntervalSince($0.lastLoud) < Self.bargeInWindow }
-            if provider == .local {
+            let continuesTurn = Date().timeIntervalSince(previousStart) < Self.onsetCoalesceWindow
+            if debugEvents {
+                log("⋯ onset: heard=\(heard) gated=\(gated) speaking=\(overlapped) "
+                    + "responseActive=\(responseActive) continuing=\(continuesTurn) provider=\(provider.rawValue) muted=\(muted)")
+            }
+            if provider == .local, !continuesTurn, heard || overlapped {
                 // Every local onset starts a new epoch and the bridge cancels everything older, heard or not, so
                 // no response.created/done or reply from before it will arrive; waiting on one would stall replies.
                 if responseActive { send(.cancelReply) }
                 replies.reset()
                 awaitingCreated = false
-                droppingAudio = audio.isSpeaking
+                droppingAudio = overlapped
             }
-            if heard {
+            if heard, overlapped {
                 cutPlayback()
-            } else if audio.isSpeaking { log("… kept talking: the mic didn't hear you (echo or noise)") }
+            } else if overlapped {
+                log("… kept talking: the mic didn't hear you (echo or noise)")
+            }
         case .functionCall(let callID, let name, let args):
             runTool(callID: callID, name: name, args: args, epoch: nil)
         case .localFunctionCall(let epoch, let callID, let name, let args):

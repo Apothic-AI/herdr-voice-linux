@@ -123,6 +123,17 @@ final class AudioEngine {
             : nil
         let requestedInput = environment["HERDR_VOICE_INPUT_DEVICE"].flatMap { library.device(matching: $0, input: true) }
         let requestedOutput = environment["HERDR_VOICE_OUTPUT_DEVICE"].flatMap { library.device(matching: $0, input: false) }
+        // A named device that isn't there used to be dropped silently and the default used instead, so a run that
+        // meant to play into a null sink played to the speakers, and a typo'd name picked the wrong microphone with
+        // nothing said about it. Name the fallback instead.
+        if let wanted = environment["HERDR_VOICE_INPUT_DEVICE"], !wanted.isEmpty, requestedInput == nil {
+            let fallback = library.device(library.defaultInputDevice)?.name ?? "the default input"
+            log("⚠ no input device matching \"\(wanted)\"; capturing from \(fallback)")
+        }
+        if let wanted = environment["HERDR_VOICE_OUTPUT_DEVICE"], !wanted.isEmpty, requestedOutput == nil {
+            let fallback = library.device(library.defaultOutputDevice)?.name ?? "the default output"
+            log("⚠ no output device matching \"\(wanted)\"; playing to \(fallback)")
+        }
 
         guard let input = requestedInput ?? preferredEchoCancel ?? library.device(library.defaultInputDevice) else {
             throw Failure(description: """
