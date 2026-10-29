@@ -143,6 +143,10 @@ final class Realtime {
         var wire: Wire?
         /// The last time the mic heard a speech-loud chunk (above the gate's opening level).
         var lastLoud = Date.distantPast
+        /// The assistant is audible right now, so audio arriving at the mic is probably our own voice.
+        var assistantAudible = false
+        /// A reply has been asked for and is not audible yet: the model is thinking or synthesising.
+        var replyPending = false
     }
     private let micShared = Locked(MicShared())
     /// Closed on purpose because nobody was talking; any speech (or an agent report) reopens it.
@@ -167,6 +171,7 @@ final class Realtime {
     /// or localRelaunchFailed.
     var relaunchLocalHelper: (() -> Void)?
     private var quietTimer: DispatchSourceTimer?
+    private var turnStateTimer: DispatchSourceTimer?
 
     init(provider: Provider, key: String, voice: String, request: URLRequest? = nil) {
         self.provider = provider
@@ -185,6 +190,7 @@ final class Realtime {
         try audio.start()
         if !providerPreparing { connect() }
         if gated { startQuietTimer() }
+        startTurnStateTimer()
     }
 
     /// On the mic queue, every 20 ms.
@@ -203,6 +209,12 @@ final class Realtime {
         let rawLevel = level
         echoReference = EchoGuard.reference(previous: echoReference, playback: audio.outLevel)
         let level = local ? EchoGuard.level(level, playback: echoReference, floor: gate.noiseFloor, ratio: echoRatio) : level
+        let micState = micShared.withLock { (audible: $0.assistantAudible, pending: $0.replyPending) }
+        if local, micState.audible, level < echoReference * echoRatio {
+            // Quiet, and we are talking: this is our own voice, not the developer. Never send it to be transcribed.
+            return
+        }
+        let onsetSuppressed = local && micState.pending
         if gated && level > gate.openThreshold { micShared.withLock { $0.lastLoud = Date() } }
         let useGate = gated || local
         let chunks = useGate ? gate.process(b64, level: level, holdOpen: local ? false : midTurn) : [b64]
@@ -213,7 +225,7 @@ final class Realtime {
         let stream = { [weak self] (wire: Wire, local: Bool) in
             guard let self else { return }
             if useGate { self.micShared.withLock { $0.lastSpeech = Date() } }
-            if local && opened {
+            if local && opened && !onsetSuppressed {
                 wire.encode(.inputStarted(utteranceID: UUID().uuidString)).forEach(self.sendRaw)
                 DispatchQueue.main.async { self.handle(.speechStarted) }
             }
@@ -296,6 +308,31 @@ final class Realtime {
             s.mayStream = !s.muted && status == .live
             return hadAudio
         }
+    }
+
+    /// 10 Hz: publishes the two facts the microphone path cannot read for itself, because they live on the main
+    /// thread while audio is handled on the mic queue.
+    ///
+    /// - `assistantAudible` lets a chunk that is probably our own voice coming back through the microphone stay on
+    ///   this machine. Apple's voice processing removed that before anything saw it; our canceller leaves enough
+    ///   that the helper transcribed the voice as the user.
+    /// - `replyPending` stops a noise onset from starting a new microphone utterance while the model is still
+    ///   working on the answer. A new utterance bumps the wire's epoch, and the helper then rejects the tool result
+    ///   the previous turn was waiting for as stale - the voice goes permanently silent after any tool call.
+    private func startTurnStateTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(30))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let audible = self.audio.isSpeaking
+            let pending = !audible && (self.responseActive || self.awaitingCreated || self.awaitingReplySince != nil)
+            self.micShared.withLock {
+                $0.assistantAudible = audible
+                $0.replyPending = pending
+            }
+        }
+        timer.resume()
+        turnStateTimer = timer
     }
 
     /// Every 5 s: close a session nobody has talked to for `quietClose`, if nothing is speaking or running.
