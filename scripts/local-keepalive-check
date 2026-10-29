@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# Proves the local session's recovery policy end to end, silently, against the real Electron helper and WebGPU pipeline.
+#
+#   1. quiet   — it stays up: one connect, no keepalive miss, no relaunch, for the whole keepalive window.
+#   2. socket  — a keepalive the helper never answers costs a socket retry, never the inference host: the helper
+#                keeps its pid (and its warm models), and the orb goes offline then blue again.
+#   3. killed  — a helper that really dies is relaunched, models and all, once: "● connected" still appears once.
+#   4. exit    — quitting the app leaves no orphaned Electron process behind.
+#
+# The two failures are the point: the same symptom (a lost socket) must not be handled the same way when the host is
+# alive as when it is gone. Scenario 2 is the regression for the reconnect loop, where every late keepalive relaunched
+# the inference host and one slow beat became a restart cycle.
+#
+#   ./scripts/local-keepalive-check             # all four, about five minutes
+#   STAY=120 ./scripts/local-keepalive-check    # quiet window, still several keepalives
+#   ./scripts/local-keepalive-check socket      # one scenario: quiet|socket|killed|exit
+#
+# Silent by construction: playback goes to the null sink and the app's output goes to a log, never the terminal.
+# Nothing is left running or on screen: the app is killed, its helper tree is killed by pattern, and the orb dies with
+# the app that draws it.
+set -uo pipefail
+
+repo=$(cd "$(dirname "$0")/.." && pwd)
+bin="$repo/.build/release/herdr-voice"
+helper="$repo/local-openlive/dist/main.mjs"
+sink=${SINK:-hv_null}
+stay=${STAY:-120}
+evidence=${EVIDENCE:-/tmp/local-keepalive-evidence}
+wanted=${1:-all}
+pass=0
+fail=0
+app_pid=""
+log=""
+mkdir -p "$evidence"
+rm -f "$evidence"/*.log 2>/dev/null
+
+say() { printf '%s\n' "$*"; }
+ok() { pass=$((pass + 1)); say "PASS  $*"; }
+no() { fail=$((fail + 1)); say "FAIL  $*"; }
+count() { grep -c "$1" "$log" 2>/dev/null || true; }
+
+# `[d]ist/main[.]mjs` cannot match this shell, whose command line never contains that text.
+helper_pids() { pgrep -f '[d]ist/main[.]mjs' 2>/dev/null | sort -n | tr '\n' ' '; }
+
+cleanup() {
+    [ -n "$app_pid" ] && kill "$app_pid" 2>/dev/null
+    pkill -x herdr-voice 2>/dev/null
+    pkill -f '[d]ist/main[.]mjs' 2>/dev/null
+    # Never leave the null sink behind: an orphaned module can outlive the run and, once its source disappears,
+    # PipeWire may re-point it at a real sink's own monitor - which is an endless feedback tone in the operator's
+    # headphones, not a theoretical risk (it happened).
+    [ -n "${sink_module:-}" ] && pactl unload-module "$sink_module" 2>/dev/null
+    app_pid=""
+    return 0
+}
+trap cleanup EXIT
+
+# Waits for a log line. Fails fast if the app dies, so a crash reads as a crash instead of a timeout.
+wait_log() {
+    local pattern=$1 limit=${2:-60}
+    for _ in $(seq 1 "$limit"); do
+        grep -q "$pattern" "$log" 2>/dev/null && return 0
+        [ -n "$app_pid" ] && ! kill -0 "$app_pid" 2>/dev/null && return 1
+        sleep 0.5
+    done
+    return 1
+}
+
+start_app() {
+    cleanup
+    log="$evidence/$1.log"
+    shift
+    env PULSE_SINK="$sink" DISPLAY="${DISPLAY:-:1}" "$@" "$bin" --provider local --here >"$log" 2>&1 &
+    app_pid=$!
+    wait_log '● connected' 240 || { no "the app never connected (see $log)"; tail -15 "$log"; return 1; }
+    return 0
+}
+
+# A settled helper tree: the node launcher plus the Electron main, GPU and renderer processes. Used to tell "the same
+# host survived a socket retry" from "a new host was launched".
+settle() { for _ in $(seq 1 40); do [ "$(helper_pids)" != "" ] && return 0; sleep 0.25; done; }
+
+say "== 0. a null sink, so a check is never audible =="
+if pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$sink"; then
+    ok "playback goes to the null sink $sink (silent)"
+else
+    sink_module=$(pactl load-module module-null-sink sink_name="$sink" 2>/dev/null) \
+        && ok "created the null sink $sink (silent)" \
+        || { no "could not create the null sink $sink"; exit 1; }
+fi
+
+say "== 1. binaries =="
+[ -x "$bin" ] || { say "building release binary"; (cd "$repo" && swift build -c release) || exit 1; }
+ok "release binary present"
+# The helper answers the keepalive from its bundle, so the bundle has to match the sources under test.
+if (cd "$repo/local-openlive" && pnpm build >"$evidence/helper-build.log" 2>&1); then
+    ok "helper bundle built from source"
+else
+    no "could not build the helper bundle (see $evidence/helper-build.log)"; exit 1
+fi
+[ -f "$helper" ] && ok "helper bundle present" || { no "helper bundle missing"; exit 1; }
+
+if [ "$wanted" = all ] || [ "$wanted" = quiet ]; then
+    say "== 2. quiet: it stays up for ${stay}s, past several keepalives =="
+    if start_app quiet; then
+        ok "one session, connected"
+        deadline=$(( $(date +%s) + stay ))
+        broke=""
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            if grep -qE '↻ |no reply to keepalive|✖ ' "$log" 2>/dev/null; then
+                broke=$(grep -m 1 -E '↻ |no reply to keepalive|✖ ' "$log"); break
+            fi
+            kill -0 "$app_pid" 2>/dev/null || { broke="the app exited"; break; }
+            sleep 1
+        done
+        [ -n "$broke" ] && no "the session did not hold: $broke" || ok "no reconnect, no relaunch, no keepalive miss in ${stay}s"
+        [ "$(count '● connected')" -eq 1 ] && ok "● connected appears once" || no "● connected appears $(count '● connected') times"
+        kill -0 "$app_pid" 2>/dev/null && ok "the app is still running" || no "the app is no longer running"
+        [ -n "$(helper_pids)" ] && ok "the helper is still alive ($(helper_pids))" || no "the helper is gone"
+        ss -tnpH state established 2>/dev/null | grep -q "pid=$app_pid," \
+            && ok "the app still holds an established socket to the helper" || no "the app holds no established socket"
+    fi
+fi
+
+if [ "$wanted" = all ] || [ "$wanted" = socket ]; then
+    say "== 3. a stalled keepalive: socket retry, same helper, no relaunch =="
+    # The helper answers keepalives from its socket handler; the fault drops two of them, so the app sees two
+    # consecutive misses and declares the *socket* dead while the host is perfectly alive.
+    if start_app socket LOCAL_OPENLIVE_FAULT_STALL_HEARTBEATS=2; then
+        ok "one session, connected"
+        before=$(helper_pids)
+        mark=$(wc -l <"$log")
+        if wait_log 'no reply to keepalive' 60; then
+            ok "the app noticed the unanswered keepalive"
+        else
+            no "the stalled keepalives were never noticed (fault injection may not have reached the helper)"
+        fi
+        grep -q 'fault injection: dropped keepalive' "$log" \
+            && ok "the helper dropped the keepalives on purpose ($(grep -m1 -o 'dropped keepalive [0-9]*/[0-9]*' "$log"))" \
+            || no "the helper never ran the fault injection"
+        # Recovery: the orb is only blue again once the session is established, and the keepalives are answered again.
+        if wait_log '◎ orb: listening' 40; then ok "the orb went offline and came back to listening"; else no "the orb never came back"; fi
+        tail -n +"$mark" "$log" | grep -q '◎ orb: offline' \
+            && ok "the orb showed offline while the socket was down" || no "the orb never showed offline"
+        after=$(helper_pids)
+        [ "$before" = "$after" ] && ok "the same helper survived: no relaunch ($after)" \
+            || no "the helper was replaced ($before → $after)"
+        [ "$(count 'relaunching Local OpenLive')" -eq 0 ] && ok "the inference host was never relaunched" \
+            || no "the inference host was relaunched $(count 'relaunching Local OpenLive') times"
+        [ "$(tail -n +"$mark" "$log" | grep -c 'no reply to keepalive')" -eq 1 ] \
+            && ok "the miss was reported once, not once per attempt" \
+            || no "the miss was reported $(tail -n +"$mark" "$log" | grep -c 'no reply to keepalive') times"
+        # Heartbeats are answered again: no further miss in the next 20 s of the same session.
+        for _ in $(seq 1 20); do sleep 1; done
+        [ "$(tail -n +"$mark" "$log" | grep -c 'no reply to keepalive')" -eq 1 ] \
+            && ok "keepalives kept being answered afterwards (no second outage)" \
+            || no "keepalives stopped being answered after the retry"
+        [ "$(count '● connected')" -eq 1 ] && ok "● connected still appears once (the retry was quiet)" \
+            || no "● connected appears $(count '● connected') times"
+    fi
+fi
+
+if [ "$wanted" = all ] || [ "$wanted" = killed ]; then
+    say "== 4. a killed helper: relaunch, models reload, orb red then blue =="
+    if start_app killed; then
+        ok "one session, connected"
+        before=$(helper_pids)
+        mark=$(wc -l <"$log")
+        pkill -9 -f '[d]ist/main[.]mjs' 2>/dev/null
+        if wait_log '↻ relaunching Local OpenLive' 60; then
+            ok "the dead host was detected as dead and relaunched"
+        else
+            no "the killed helper was never relaunched"
+        fi
+        # The models reload from the warm cache; the app says ready again, and only then is the session back.
+        if grep -q '● connected' "$log" && wait_log '◎ orb: listening' 240; then
+            ok "the session came back once the models were ready"
+        else
+            no "the session never came back after the relaunch"
+        fi
+        after=$(helper_pids)
+        [ "$before" != "$after" ] && ok "a new helper is serving ($before → $after)" || no "the helper tree did not change"
+        [ "$(count 'relaunching Local OpenLive')" -eq 1 ] && ok "it relaunched exactly once" \
+            || no "it relaunched $(count 'relaunching Local OpenLive') times"
+        tail -n +"$mark" "$log" | grep -q '◎ orb: offline' && ok "the orb showed offline (red) during the outage" \
+            || no "the orb never showed offline"
+        [ "$(count '● connected')" -eq 1 ] && ok "● connected still appears once (the recovery was not a new first session)" \
+            || no "● connected appears $(count '● connected') times"
+        # One short line at most, and only because the models reloaded.
+        [ "$(tail -n +"$mark" "$log" | grep -c 'reloading the speech model')" -le 1 ] \
+            && ok "no chatter about the reload (at most one line)" || no "the reload was announced more than once"
+    fi
+fi
+
+if [ "$wanted" = all ] || [ "$wanted" = exit ] || [ "$wanted" = killed ] || [ "$wanted" = socket ]; then
+    say "== 5. quitting leaves nothing behind =="
+    kill "$app_pid" 2>/dev/null
+    for _ in $(seq 1 80); do
+        ! kill -0 "$app_pid" 2>/dev/null && [ -z "$(helper_pids)" ] && break
+        sleep 0.25
+    done
+    app_pid=""
+    [ -z "$(helper_pids)" ] && ok "no orphaned Electron process after the app exited" \
+        || no "orphaned Electron processes left: $(helper_pids)"
+    pgrep -x herdr-voice >/dev/null 2>&1 && no "the app is still running" || ok "no app left running"
+    cleanup
+fi
+
+say ""
+say "checks passed: $pass   failed: $fail   (logs: $evidence)"
+[ "$fail" -eq 0 ] || exit 1

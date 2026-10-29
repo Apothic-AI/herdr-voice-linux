@@ -1,4 +1,4 @@
-import AppKit
+import Foundation
 import HerdrVoiceCore
 
 // ponytail: Swift 5 language mode with main-queue confinement instead of actors; move to Swift 6 strict
@@ -12,7 +12,7 @@ if let dir = ProcessInfo.processInfo.environment["HERDR_PLUGIN_CONFIG_DIR"] {
         for (key, value) in settings { setenv(key, value, 0) } // a real environment variable still wins
         if !rejected.isEmpty {
             log("⚠ \(PluginConfig.fileName): ignored \(rejected.joined(separator: ", ")) (only HERDR_VOICE_* settings; "
-                + "API keys go in the Keychain with herdr-voice setup)")
+                + "API keys go in the \(Keychain.storeDescription) with herdr-voice setup)")
         }
     } else {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -37,7 +37,7 @@ if args.count > 1 {
         herdr-voice --here             start it in this pane
         herdr-voice --provider NAME    use local, grok, openai or gemini (default: local once set up, else grok)
         herdr-voice stop               stop the running voice
-        herdr-voice setup [NAME]       store an API key in the Keychain
+        herdr-voice setup [NAME]       store an API key in the platform secret store
         herdr-voice install-command    put herdr-voice on your PATH (~/.local/bin)
         herdr-voice uninstall-command  undo install-command
         herdr-voice tool [NAME JSON]   run one of the voice's tools by hand
@@ -97,17 +97,9 @@ if args.count > 1, args[1] == "tool" {
     exit(0)
 }
 
-// Whatever was in front when we were launched: normally the terminal running Herdr.
-let launchedFrom = NSWorkspace.shared.frontmostApplication
-let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
-// An accessory app can still be activated at launch; it then holds focus with no window to type into, so
-// keystrokes stop reaching the terminal (and the pinned orb hides). Hand focus straight back.
-DispatchQueue.main.async {
-    guard NSApp.isActive, let previous = launchedFrom, previous.processIdentifier != getpid() else { return }
-    NSApp.yieldActivation(to: previous)
-    previous.activate()
-}
+// Platform presentation: AppKit hands focus straight back to the terminal on macOS; on Linux there is no
+// activation policy and the orb never takes focus, so it does nothing.
+AppHost.prepareForLaunch()
 
 // --orb-demo: orb only, driven by the live mic, cycling moods every 4s. No network, no key.
 if args.contains("--orb-demo") {
@@ -135,7 +127,7 @@ if args.contains("--orb-demo") {
     do { try audio.start() } catch { log("✖ audio: \(error.localizedDescription)"); exit(1) }
     log("orb demo: talk to see it react; ctrl+c to quit")
     signal(SIGINT) { _ in exit(0) }
-    app.run()
+    AppHost.runMainLoop()
 }
 
 guard let provider = Provider(rawValue: providerName) else {
@@ -214,7 +206,9 @@ func loadLocal(onFailure: @escaping (Error) -> Void) {
         }
     }
 }
-// A lost local connection means the helper crashed: relaunch it, backing off like any failed reconnect.
+// A lost local connection is redialed on the helper's port while the helper is alive; only a helper that is really
+// gone is relaunched (see Reconnect.relaunchesHelper). A second, slower failure backs off like any other reconnect.
+session.localHelperAlive = { localRuntime.isRunning }
 session.relaunchLocalHelper = {
     loadLocal { session.localRelaunchFailed("Local OpenLive relaunch failed: \($0.localizedDescription)") }
 }
@@ -260,6 +254,22 @@ let orb = Orb(onClick: { session.toggleMute() }, menuChoices: modelChoices, onQu
 })
 Hotkey.registerMute { session.toggleMute() }
 
+// A SIGTERM (a check, a closing pane, `pkill`) must take the helper down with it: an orphaned Electron host holds the
+// GPU and its model cache. The orb's quit path stops the same things, so both exits behave alike, and the sources
+// stay alive in `signalSources` where a signal cannot free one mid-handler.
+var signalSources: [DispatchSourceSignal] = []
+for sig in [SIGTERM, SIGINT, SIGHUP] {
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler {
+        session.shutdown()
+        localRuntime.stop()
+        exit(0)
+    }
+    source.resume()
+    signalSources.append(source)
+}
+
 // Pin the orb to the terminal window showing Herdr; HERDR_VOICE_ORB_PIN=0 keeps it in the screen corner.
 let windowTracker = WindowTracker()
 if env["HERDR_VOICE_ORB_PIN"] != "0" {
@@ -273,15 +283,30 @@ session.audio.onSpeakingChanged = { speaking in
     Hotkey.setStopKey(active: speaking) { session.stopSpeech(reason: "Esc") }
 }
 
+/// The orb's mood as of the last frame, so a change is logged once instead of once per frame.
+final class MoodTicker {
+    private var last: Mood?
+    func changed(to mood: Mood) -> Bool {
+        guard mood != last else { return false }
+        last = mood
+        return true
+    }
+}
+let moodTicker = MoodTicker()
+
 orb.run {
     let a = session.audio
     let loading = localActivation.loading
-    let mood = Activity.mood(loading: loading, disconnected: session.status == .disconnected,
+    // Anything but a live session is offline as far as the microphone is concerned: never show listening-blue while
+    // what is said has nowhere to go. Red while reconnecting, blue again the moment the session is back.
+    let live = session.status == .live
+    let mood = Activity.mood(loading: loading, disconnected: !live,
                              dormant: session.dormant, muted: session.muted, speaking: a.isSpeaking,
                              agentsWorking: !session.busyAgents.isEmpty, micQuiet: a.micLevel < 0.02)
+    if moodTicker.changed(to: mood) { log("◎ orb: \(mood)") }
     // Both directions at once: talking over the assistant shows your push and its core together.
     return Orb.Frame(mood: mood, mic: session.muted ? 0 : a.micLevel, voice: a.isSpeaking ? a.outLevel : 0,
-                     thinking: loading || (session.status != .disconnected && session.thinking))
+                     thinking: loading || (live && session.thinking))
 }
 
 do {
@@ -298,7 +323,7 @@ if provider == .local {
     }
 }
 signal(SIGINT) { _ in exit(0) }
-app.run()
+AppHost.runMainLoop()
 
 /// 220 Hz with a wandering pitch, amplitude-shaped into ~4 "syllables" a second, as base64 PCM16 24 kHz.
 func demoSpeech(seconds: Double) -> String {

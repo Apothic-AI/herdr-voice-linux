@@ -1,6 +1,8 @@
 import Foundation
 import HerdrVoiceCore
-import Security
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// One owned Electron inference host. Its session token and optional brain key travel over stdin, never argv.
 final class LocalRuntime {
@@ -44,10 +46,23 @@ final class LocalRuntime {
         child.executableURL = URL(fileURLWithPath: electron)
         child.arguments = [main]
         var childEnvironment: [String: String] = [:]
-        for key in ["HOME", "TMPDIR", "PATH", "LANG", "LC_ALL", "USER", "LOGNAME", "XDG_CACHE_HOME"] {
+        // Electron is a GUI process. On macOS it needs nothing from the environment to come up; on Linux it
+        // needs the display, the X authority and the session bus, or it exits with "Missing X server or $DISPLAY".
+        // The list stays narrow on purpose: this child is a sandboxed inference host, not a shell.
+        #if os(Linux)
+        let platformKeys = ["DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
+        #else
+        let platformKeys: [String] = []
+        #endif
+        for key in ["HOME", "TMPDIR", "PATH", "LANG", "LC_ALL", "USER", "LOGNAME", "XDG_CACHE_HOME"] + platformKeys {
             if let value = environment[key] { childEnvironment[key] = value }
         }
         childEnvironment["OLLAMA_NO_CLOUD"] = "1"
+        // A check may ask the helper to drop keepalives, to prove a dropped socket never relaunches the host. Only
+        // ever set by scripts/local-keepalive-check; absent in normal use.
+        if let stall = environment["LOCAL_OPENLIVE_FAULT_STALL_HEARTBEATS"] {
+            childEnvironment["LOCAL_OPENLIVE_FAULT_STALL_HEARTBEATS"] = stall
+        }
         child.environment = childEnvironment
         let stdin = Pipe(), stdout = Pipe()
         child.standardInput = stdin
@@ -130,6 +145,9 @@ final class LocalRuntime {
         }
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        // The helper is a Node server: it only sees an upgrade if the handshake asks for one. Same fix the cloud
+        // providers get — without it the request arrives as a plain GET and the helper answers 404.
+        request = Provider.websocketHandshakeFix(request)
         return Ready(request: request, label: label, probe: object["probe"] as? [String: Any] ?? [:])
     }
 
@@ -157,6 +175,14 @@ final class LocalRuntime {
         }
     }
 
+    /// Whether the helper this runtime started is still alive. A dropped socket is not a dead host: the app redials
+    /// the same port while this is true, and only relaunches (with its ~9 s warm-up) when it is false.
+    var isRunning: Bool {
+        lifecycle.lock()
+        defer { lifecycle.unlock() }
+        return process?.isRunning ?? false
+    }
+
     func stop() {
         lifecycle.lock()
         generation += 1
@@ -167,7 +193,18 @@ final class LocalRuntime {
         lifecycle.unlock()
         try? pipe?.fileHandleForWriting.close()
         guard let child else { return }
+        terminateAndReap(child)
+    }
+
+    /// Stops a helper for good. SIGTERM lets Electron take its GPU and renderer children down with it; SIGKILL follows
+    /// if it ignores that, so no orphaned host is ever left holding the GPU. Waiting matters as much as killing:
+    /// without it the next host races a dying one for the GPU, and two Electron trees end up on one machine.
+    private func terminateAndReap(_ child: Process, grace: TimeInterval = 2) {
         if child.isRunning { child.terminate() }
+        let deadline = Date().addingTimeInterval(grace)
+        while child.isRunning && Date() < deadline { usleep(50_000) }
+        if child.isRunning { kill(child.processIdentifier, SIGKILL) }
+        child.waitUntilExit()
     }
 
     private func beginPreparation() -> Int {
@@ -180,7 +217,7 @@ final class LocalRuntime {
         process = nil
         lifecycle.unlock()
         try? pipe?.fileHandleForWriting.close()
-        if let child, child.isRunning { child.terminate() }
+        if let child { terminateAndReap(child) }
         return operation
     }
 
@@ -193,7 +230,7 @@ final class LocalRuntime {
         process = nil
         lifecycle.unlock()
         try? pipe?.fileHandleForWriting.close()
-        if child.isRunning { child.terminate() }
+        terminateAndReap(child)
     }
 
     private static func runtimeRoot(environment: [String: String]) throws -> URL {
@@ -238,7 +275,7 @@ final class LocalRuntime {
             let service = kind == "keyed" ? (setting("KEYCHAIN") ?? "HERDR_LOCAL_BRAIN_API_KEY") : setting("KEYCHAIN")
             if let service, !service.isEmpty {
                 guard let key = Keychain.password(service: service) else {
-                    throw RuntimeError.failed("No key found in Keychain service \(service)")
+                    throw RuntimeError.failed("No key found in \(Keychain.storeDescription) service \(service)")
                 }
                 value["apiKey"] = key
             }
@@ -247,9 +284,11 @@ final class LocalRuntime {
     }
 
     private func randomToken() throws -> String {
-        var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-            throw RuntimeError.failed("Could not create Local OpenLive session token")
+        let bytes: [UInt8]
+        do {
+            bytes = try Random.bytes(32)
+        } catch {
+            throw RuntimeError.failed("Could not create Local OpenLive session token: \(error)")
         }
         return Data(bytes).base64EncodedString().replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")

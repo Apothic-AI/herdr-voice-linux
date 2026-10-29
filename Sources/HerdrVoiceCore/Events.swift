@@ -17,6 +17,9 @@ public enum ServerEvent: Equatable {
     case responseDone
     /// The provider will close this connection soon (Gemini `goAway`).
     case sessionEnding
+    /// The local helper answered the app's keepalive (see `LocalWire.heartbeat`). Nothing else is implied: it means
+    /// the socket is alive, not that a turn is in progress.
+    case heartbeatAck
     /// A handle to resume this session, context included, on the next connection (Gemini).
     case resumptionHandle(String)
     case error(String)

@@ -5,12 +5,32 @@ import { app, BrowserWindow, ipcMain, session as electronSession } from "electro
 import { WebSocketServer, type WebSocket } from "ws";
 import { streamProvider } from "../vendor/harness/index.js";
 import { brainLabel, providerInfo, validateBrain, type BrainConfig } from "./brain.js";
+import { gpuSwitches } from "./gpu.js";
 import { validateManifest } from "./manifest.js";
 import { authorizeUpgrade } from "./security.js";
 import { BridgeSession, type WireMessage } from "./session.js";
 import { migrateLegacyState, PARTITION, statePaths } from "./state.js";
 
 type BootConfig = { token: string; stateDir: string; setup?: boolean; brain?: BrainConfig };
+
+/**
+ * Test hook for the app's liveness policy: `LOCAL_OPENLIVE_FAULT_STALL_HEARTBEATS=<n>` swallows the next n keepalives,
+ * so a check can drop the socket without touching the inference host. Unset (0) in normal use.
+ */
+let droppedKeepalives = 0;
+function stallKeepalive(): boolean {
+  const budget = Number(process.env.LOCAL_OPENLIVE_FAULT_STALL_HEARTBEATS ?? 0);
+  if (!Number.isFinite(budget) || budget <= 0 || droppedKeepalives >= budget) return false;
+  droppedKeepalives += 1;
+  process.stderr.write(`local OpenLive: fault injection: dropped keepalive ${droppedKeepalives}/${budget}\n`);
+  return true;
+}
+
+// Must run before app readiness, and before the GPU process starts on window creation. Swift launches this
+// helper with a fixed argv, so the platform switch has to come from inside the helper.
+for (const { name, value } of gpuSwitches(process.platform, app.commandLine.getSwitchValue("enable-features"))) {
+  app.commandLine.appendSwitch(name, value);
+}
 
 async function run(): Promise<void> {
 const boot = await readBootConfig();
@@ -90,6 +110,13 @@ if (boot.setup) {
         if (binary || bytes > 2 * 1024 * 1024) throw new Error("text message required");
         const message = JSON.parse(raw.toString()) as WireMessage;
         if ("epoch" in message && Number.isSafeInteger(message.epoch)) epoch = message.epoch;
+        // Answered here, synchronously, and never through the bridge: a turn in flight (STT or TTS awaiting the GPU)
+        // must not be able to hold up the one message that proves the socket is alive. A late answer makes the app
+        // reconnect, so the answer deliberately depends on no promise at all.
+        if (message.type === "heartbeat") {
+          if (!stallKeepalive() && client.readyState === client.OPEN) client.send(JSON.stringify({ type: "heartbeat.ack" }));
+          return;
+        }
         await bridge.handle(message);
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
@@ -165,7 +192,7 @@ async function preflightBrain(value: BrainConfig): Promise<Record<string, unknow
   if (value.kind !== "local") return { mode: "hybrid", checked: false };
   const base = new URL(value.baseURL);
   const tagsURL = new URL("/api/tags", base);
-  const tagsResponse = await withTimeout(fetch(tagsURL), 15_000, "local Ollama model inventory");
+  const tagsResponse = await withTimeout(reachable(fetch(tagsURL), base), 15_000, "local Ollama model inventory");
   if (!tagsResponse.ok) throw new Error(`local Ollama model inventory failed (${tagsResponse.status})`);
   const tags = await tagsResponse.json() as { models?: Array<{ name?: string; model?: string }> };
   const installed = tags.models?.some((model) => model.name === value.model || model.model === value.model) ?? false;
@@ -174,16 +201,25 @@ async function preflightBrain(value: BrainConfig): Promise<Record<string, unknow
     return { mode: "local", model: value.model, installed: true, inference: "deferred-for-protocol" };
   }
   const completionURL = new URL(value.baseURL.replace(/\/$/, "") + "/chat/completions");
-  const completion = await withTimeout(fetch(completionURL, {
+  const completion = await withTimeout(reachable(fetch(completionURL, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: value.model, messages: [{ role: "user", content: "Reply OK." }],
                            max_tokens: 2, stream: false, reasoning_effort: value.reasoningEffort ?? "none" }),
-  }), 60_000, "local Ollama inference probe");
+  }), base), 60_000, "local Ollama inference probe");
   if (!completion.ok) throw new Error(`local Ollama inference probe failed (${completion.status})`);
   const body = await completion.json() as { choices?: unknown[] };
   if (!Array.isArray(body.choices) || body.choices.length === 0) throw new Error("local Ollama inference probe returned no choice");
   return { mode: "local", model: value.model, installed: true, inference: "ok" };
+}
+
+// Node's fetch rejects a refused connection as a bare "fetch failed", which hides the one fact the operator needs:
+// the loopback brain server is not running. Name the endpoint and the likely cause instead.
+function reachable(request: Promise<Response>, base: URL): Promise<Response> {
+  return request.catch((error: unknown) => {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`local brain at ${base.origin} is unreachable (${detail}); is \`ollama serve\` running?`);
+  });
 }
 
 async function readBootConfig(): Promise<BootConfig> {
