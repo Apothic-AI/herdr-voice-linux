@@ -135,7 +135,22 @@ final class AudioEngine {
             log("⚠ no output device matching \"\(wanted)\"; playing to \(fallback)")
         }
 
-        guard let input = requestedInput ?? preferredEchoCancel ?? library.device(library.defaultInputDevice) else {
+        // A monitor or loopback source is our own playback coming back, not the room. Capturing it makes a voice app
+        // hear itself and howl (the loud tone an operator hit when PipeWire's default source was a monitor). Honour one
+        // only when it was named explicitly; otherwise pick a real capture device and say so.
+        var chosenInput = requestedInput ?? preferredEchoCancel
+        if chosenInput == nil {
+            let defaultDevice = library.device(library.defaultInputDevice)
+            if let defaultDevice, !defaultDevice.isFeedbackProne {
+                chosenInput = defaultDevice
+            } else if let capture = library.devices().first(where: { !$0.isFeedbackProne && $0.maxInputChannels > 0 }) {
+                log("⚠ the default input is a loopback (\(defaultDevice?.name ?? "none")); capturing from \(capture.name)")
+                chosenInput = capture
+            } else {
+                chosenInput = defaultDevice
+            }
+        }
+        guard let input = chosenInput else {
             throw Failure(description: """
             herdr-voice: no audio input device. PortAudio sees \(library.deviceCount) device(s) but none can \
             capture; check that the microphone is connected and not in use, or set HERDR_VOICE_INPUT_DEVICE.

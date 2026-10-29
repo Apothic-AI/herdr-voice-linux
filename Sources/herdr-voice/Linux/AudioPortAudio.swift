@@ -56,6 +56,14 @@ final class PortAudio {
             let lower = name.lowercased()
             return lower.contains("echo-cancel") || lower.contains("echocancel")
         }
+
+        /// A monitor of an output, or a hardware loopback, carries what is being *played* rather than what the room
+        /// sounds like. A voice app that captures one hears its own voice and feeds it back: a loud tone whose pitch
+        /// tracks the microphone gain. Never choose one unless it was asked for by name.
+        var isFeedbackProne: Bool {
+            let lower = name.lowercased()
+            return lower.hasSuffix(".monitor") || lower.contains("monitor of") || lower.contains("aloop")
+        }
     }
 
     let version: String
