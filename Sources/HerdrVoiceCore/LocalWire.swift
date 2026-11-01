@@ -85,6 +85,11 @@ public final class LocalWire: Wire {
             return [["type": "input.append", "utterance_id": utteranceID, "epoch": epoch, "audio": audio]]
         case .audioPaused:
             guard let utteranceID else { return [] }
+            // The utterance is committed: the helper will not take another frame for it, and answering one with
+            // "unknown microphone utterance" is all it can do. Forgetting the id here is what makes the *next* gate
+            // opening start a new utterance instead of appending to a closed one - which is exactly what happened while
+            // a suppressed onset let audio through with no `input.begin` in front of it.
+            self.utteranceID = nil
             return [["type": "input.commit", "utterance_id": utteranceID, "epoch": epoch]]
         case .clearInput:
             epoch += 1
