@@ -75,9 +75,19 @@ start_app() {
     cleanup
     log="$evidence/$1.log"
     shift
-    env PULSE_SINK="$sink" DISPLAY="${DISPLAY:-:1}" "$@" "$bin" --provider local --here >"$log" 2>&1 &
+    # Output is named as a PortAudio device, not via PULSE_SINK: the app chooses its output with
+    # library.defaultOutputDevice (AudioEngine.swift:159), which PULSE_SINK never reaches, so this check used to play
+    # the connect greeting into the operator's real speakers. HERDR_VOICE_OUTPUT_DEVICE is matched by name
+    # (case-insensitive substring) against the PortAudio device, where a null sink appears as "<name> Audio/Sink sink".
+    env HERDR_VOICE_OUTPUT_DEVICE="$sink" DISPLAY="${DISPLAY:-:1}" "$@" "$bin" --provider local --here >"$log" 2>&1 &
     app_pid=$!
     wait_log '● connected' 240 || { no "the app never connected (see $log)"; tail -15 "$log"; return 1; }
+    # A named device that matches nothing falls back to the real default with only a warning, so silence has to be
+    # asserted rather than assumed.
+    grep -q 'no output device matching' "$log" && {
+        no "the app did not find the null sink and would be audible: $(grep -m1 'no output device matching' "$log")"
+        return 1
+    }
     return 0
 }
 

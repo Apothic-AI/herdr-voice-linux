@@ -5,7 +5,9 @@
 #   ./scripts/linux-voice-loop-check            # full run in a fresh Herdr pane
 #
 # Two things this script insists on, because both have bitten us:
-#   - playback is routed into a null sink (PULSE_SINK=hv_null), so a check is never audible on the operator's machine;
+#   - playback goes to a null sink, named as a PortAudio device (HERDR_VOICE_OUTPUT_DEVICE), so a check is never
+#     audible on the operator's machine. PULSE_SINK alone does NOT do this: the app picks its output with PortAudio's
+#     default device, so a check that set only PULSE_SINK played aloud into the operator's headphones;
 #   - the mic streams continuously (HERDR_VOICE_STREAM=always), because normally the app only sends audio while its
 #     speech gate is open — on a silent machine that is nothing at all, and the wire behaviour is what is under test.
 #
@@ -93,7 +95,7 @@ tab=$(printf '%s' "$created" | python3 -c 'import json,sys; print(json.load(sys.
 [ -n "$pane" ] && ok "voice pane $pane created" || { no "could not create a Herdr tab"; exit 1; }
 
 # A dummy key is fine: the stub is the server, and it never authenticates.
-herdr pane run "$pane" "PULSE_SINK=$sink HERDR_VOICE_STREAM=always HERDR_VOICE_URL=ws://127.0.0.1:$port OPENAI_API_KEY=stub-key $bin --provider openai --here" >/dev/null 2>&1
+herdr pane run "$pane" "HERDR_VOICE_OUTPUT_DEVICE=$sink HERDR_VOICE_STREAM=always HERDR_VOICE_URL=ws://127.0.0.1:$port OPENAI_API_KEY=stub-key $bin --provider openai --here" >/dev/null 2>&1
 
 say "== 3. the app connects and the microphone reaches the wire =="
 if connected=$(await_report connected 1 "${CONNECT_TIMEOUT:-40}"); then
