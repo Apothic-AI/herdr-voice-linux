@@ -13,6 +13,14 @@ import Glibc
 //
 // Usage: linux-audio-driver <devices|capture|playback|aec|cpu|synthetic> [args]
 
+// The Linux audio sources are app code and report through the app's `log`. This harness compiles them standalone
+// (see scripts/linux-audio-check), so it supplies that symbol itself — on stderr, because stdout carries the RESULT
+// lines the check parses.
+func log(_ line: String) {
+    fputs(line + "\n", stderr)
+    fflush(stderr)
+}
+
 enum DriverError: Error, CustomStringConvertible {
     case failed(String)
     var description: String {
