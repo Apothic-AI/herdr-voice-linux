@@ -11,7 +11,7 @@ import HerdrVoiceCore
 /// - otherwise only on-screen windows are listed (~57 here), and only the terminal's are decoded;
 /// - the full window list (~395 here, including every off-screen window) and the process scan run every 2 s.
 final class WindowTracker {
-    typealias Result = (hasHost: Bool, frame: CGRect?)
+    typealias Result = (hasHost: Bool, frame: Rect?)
 
     private let queue = DispatchQueue(label: "herdr-voice.window-tracker", qos: .utility)
     private var timer: DispatchSourceTimer?
@@ -21,7 +21,7 @@ final class WindowTracker {
     private var hosts = Set<Int32>()
     private var cachedHostWindows: [WindowPin.Window] = []
     private var lastSlowRefresh = Date.distantPast
-    private var lastPublished: (Bool, CGRect?)?
+    private var lastPublished: (Bool, Rect?)?
     private var lastQuery = Date.distantPast
     private var lastResult: Result = (false, nil)
 
@@ -128,14 +128,14 @@ final class WindowTracker {
             else { continue }
             let name = (w[kCGWindowName] as? String).flatMap { $0.isEmpty ? nil : $0 }
             out.append(WindowPin.Window(number: number, pid: pid, layer: (w[kCGWindowLayer] as? NSNumber)?.intValue ?? 0,
-                                        name: name, frame: frame,
+                                        name: name, frame: Rect(frame),
                                         isOnScreen: (w[kCGWindowIsOnscreen] as? NSNumber)?.boolValue ?? false))
         }
         return out
     }
 
     /// CGWindowList uses a top-left origin on the main display; AppKit uses bottom-left. Main thread (NSScreen).
-    private static func toAppKit(_ r: CGRect) -> NSRect {
+    private static func toAppKit(_ r: Rect) -> NSRect {
         let mainHeight = NSScreen.screens.first?.frame.height ?? 0
         return NSRect(x: r.minX, y: mainHeight - r.maxY, width: r.width, height: r.height)
     }
