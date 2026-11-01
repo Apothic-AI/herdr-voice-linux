@@ -15,19 +15,21 @@ import Glibc
 /// are safe from a real-time audio callback as long as the critical section stays short.
 public final class UnfairLock {
     #if canImport(os)
-    private let lock: UnsafeMutablePointer<os_unfair_lock>
+    // Named `handle`, not `lock`: a stored property called `lock` collides with the `lock()` method below and
+    // Darwin's overlay rejects the pair as an invalid redeclaration. Linux's branch never had the collision.
+    private let handle: UnsafeMutablePointer<os_unfair_lock>
 
     public init() {
-        lock = .allocate(capacity: 1)
-        lock.initialize(to: os_unfair_lock())
+        handle = .allocate(capacity: 1)
+        handle.initialize(to: os_unfair_lock())
     }
 
-    deinit { lock.deallocate() }
+    deinit { handle.deallocate() }
 
     /// Never blocks: returns false when someone else holds the lock.
-    public func tryLock() -> Bool { os_unfair_lock_trylock(lock) }
-    public func lock() { os_unfair_lock_lock(lock) }
-    public func unlock() { os_unfair_lock_unlock(lock) }
+    public func tryLock() -> Bool { os_unfair_lock_trylock(handle) }
+    public func lock() { os_unfair_lock_lock(handle) }
+    public func unlock() { os_unfair_lock_unlock(handle) }
     #else
     private var mutex = pthread_mutex_t()
 
