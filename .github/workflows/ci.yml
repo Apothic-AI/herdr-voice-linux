@@ -1,17 +1,22 @@
 name: CI
-on:
+# Every job needs a timeout-minutes. Without one a hung step runs until GitHub's 6-hour default: that happened here
+# twice (swift-linux sat in `swift test` and was cancelled after 6h1m on run 40804926545, and again for 15+ minutes on
+# 41280501269 where it had to be cancelled by hand). A hang should read as a failed check in minutes.
+on: 
   pull_request:
   push:
     branches-ignore: [main, master]
 jobs:
   swift-macos:
     runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: swift test
       - run: swift build -c release
   swift-linux:
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: swift-actions/setup-swift@v2
@@ -24,6 +29,7 @@ jobs:
       - run: swift build -c release
   local-openlive:
     runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -41,6 +47,7 @@ jobs:
         working-directory: local-openlive
   local-openlive-linux:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
