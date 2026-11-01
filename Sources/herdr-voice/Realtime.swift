@@ -59,6 +59,9 @@ final class Realtime {
     private var speechOverlappedPlayback = false
     /// Set when the developer stops talking, until the reply starts; expires in case no reply comes.
     private var awaitingReplySince: Date?
+    /// The last time the provider said anything about the conversation (not a heartbeat). A reply with no news for
+    /// `replyStall` is treated as finished: see `settleStalledReply`.
+    private var lastReplyEvent = Date()
     private var toolsRunning = 0
 
     /// Something is actively working: the voice model processing (between your speech and its voice, or
@@ -119,6 +122,9 @@ final class Realtime {
     /// new epoch, so it cancelled the reply the first onset had just asked for (a fraction of a second of speech,
     /// then silence). One utterance is one turn.
     static let onsetCoalesceWindow: TimeInterval = 1.2
+    /// A reply that has produced no audio, no transcript and no event at all for this long is not pending, it is over.
+    /// The local helper sends `response.created` and then, when its greeting fails, nothing whatsoever.
+    static let stall = ReplyStall(timeout: 20)
     /// Mic-queue only. HERDR_VOICE_GATE_THRESHOLD pins the opening level for unusual hardware.
     private var gate = SpeechGate<String>(
         overrideThreshold: ProcessInfo.processInfo.environment["HERDR_VOICE_GATE_THRESHOLD"].flatMap(Float.init))
@@ -147,6 +153,10 @@ final class Realtime {
         var assistantAudible = false
         /// A reply has been asked for and is not audible yet: the model is thinking or synthesising.
         var replyPending = false
+        /// Diagnostic only, so the gate meter can say why a pending reply is still pending: how many tool calls the
+        /// wait is on, and how long the provider has been silent.
+        var callsInFlight = 0
+        var silentFor: TimeInterval = 0
     }
     private let micShared = Locked(MicShared())
     /// Closed on purpose because nobody was talking; any speech (or an agent report) reopens it.
@@ -268,15 +278,25 @@ final class Realtime {
     /// On the mic queue: what the gate sees, so any mic can be checked and tuned.
     private func debugMeter(level: Float, opened: Bool, closed: Bool) {
         let floor = gate.noiseFloor, open = gate.openThreshold
+        let turn = micShared.withLock { (pending: $0.replyPending, audible: $0.assistantAudible,
+                                         calls: $0.callsInFlight, silent: $0.silentFor) }
+        // `pending` is on these lines because a pending reply suppresses the onset that opens a microphone utterance:
+        // when it is stuck, the gate opens and closes on real speech and nothing at all goes to the provider, which is
+        // indistinguishable from a dead microphone from the outside. `calls` and `silent` say which condition is
+        // holding it there: a tool call we owe an answer, or a provider that has said nothing for too long.
+        let turnState = String(format: "pending %@ audible %@ calls %d silent %.0fs",
+                               turn.pending ? "yes" : "no", turn.audible ? "yes" : "no",
+                               turn.calls, turn.silent)
         if opened || closed {
-            let line = String(format: "🎚  gate %@  level %.4f  floor %.4f  open at %.4f  playback %.4f",
-                              opened ? "OPEN " : "close", level, floor, open, audio.outLevel)
+            let line = String(format: "🎚  gate %@  level %.4f  floor %.4f  open at %.4f  playback %.4f  ",
+                              opened ? "OPEN " : "close", level, floor, open, audio.outLevel) + turnState
             DispatchQueue.main.async { log(line) }
         }
         meterPeak = max(meterPeak, level)
         meterChunks += 1
         guard meterChunks >= 250 else { return } // every 5 s
-        let line = String(format: "🎚  floor %.4f  open at %.4f  peak %.4f (last 5 s)", floor, open, meterPeak)
+        let line = String(format: "🎚  floor %.4f  open at %.4f  peak %.4f  ", floor, open, meterPeak)
+            + turnState + " (last 5 s)"
         meterPeak = 0
         meterChunks = 0
         DispatchQueue.main.async { log(line) }
@@ -325,14 +345,41 @@ final class Realtime {
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             let audible = self.audio.isSpeaking
+            self.settleStalledReply(audible: audible)
             let pending = !audible && (self.responseActive || self.awaitingCreated || self.awaitingReplySince != nil)
+            let calls = self.replies.callsInFlight
+            let silent = Date().timeIntervalSince(self.lastReplyEvent)
             self.micShared.withLock {
                 $0.assistantAudible = audible
                 $0.replyPending = pending
+                $0.callsInFlight = calls
+                $0.silentFor = silent
             }
         }
         timer.resume()
         turnStateTimer = timer
+    }
+
+    /// A reply that never arrives must not hold the microphone shut.
+    ///
+    /// `replyPending` suppresses the microphone onset: it keeps a noise from bumping the wire's epoch while a reply is
+    /// on its way, which is what stopped a tool result from going stale. But the local helper answers a request with
+    /// `response.created` and then, when its greeting fails to produce anything, no further event at all. The flag then
+    /// stayed true for the rest of the session: every gate opening was suppressed, `input.begin` was never sent, and so
+    /// not one audio frame ever reached the provider. From outside that reads as "it hears me and says nothing" - the
+    /// gate meter showed a 0.23 level against a 0.002 threshold, over and over, and no transcript ever appeared.
+    ///
+    /// So a stalled reply is settled here as finished rather than left pending forever (the rule itself is `ReplyStall`,
+    /// which is where the three conditions that keep a live reply alive are written down and tested).
+    private func settleStalledReply(audible: Bool) {
+        let pending = responseActive || awaitingCreated || awaitingReplySince != nil
+        guard Self.stall.isStalled(now: Date(), lastEvent: lastReplyEvent, audible: audible,
+                                   callsInFlight: replies.callsInFlight, pending: pending)
+        else { return }
+        replies.reset()
+        awaitingCreated = false
+        awaitingReplySince = nil
+        log("⚠ no reply arrived within \(Int(Self.stall.timeout))s; the microphone is open again")
     }
 
     /// Every 5 s: close a session nobody has talked to for `quietClose`, if nothing is speaking or running.
@@ -700,6 +747,18 @@ final class Realtime {
     }
 
     private func handle(_ event: ServerEvent) {
+        // Only the provider's own news restarts the stall clock. A heartbeat proves the socket is alive and nothing
+        // more; and `speechStarted`/`speechStopped` are posted *by this app* when the gate opens and closes, so counting
+        // them restarted the clock on every utterance — the reply that never came stayed "pending" forever, and the
+        // meter showed `silent 5s` over and over while nothing was sent.
+        switch event {
+        case .responseCreated, .responseDone, .audioDelta, .assistantTranscript, .assistantTranscriptItem,
+             .assistantTranscriptTruncated, .assistantTranscriptDelta, .userTranscript, .functionCall,
+             .localFunctionCall, .error:
+            lastReplyEvent = Date()
+        default:
+            break
+        }
         switch event {
         case .sessionReady:
             break
