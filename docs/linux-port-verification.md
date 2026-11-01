@@ -14,11 +14,12 @@ same protocol, plus the golden wire tests — and not against OpenAI, xAI or Goo
 | Check | Command | Result |
 |---|---|---|
 | Debug build | `swift build` | `Build complete!`, 0 errors |
-| Unit tests | `swift test` | **200 tests passed** |
-| Release build | `swift build -c release` | `Build complete! (20.64s)`, 0 errors |
+| Unit tests | `swift test` | **203 tests passed** |
+| Release build | `swift build -c release` | `Build complete!`, 0 errors |
+| macOS build and tests | CI `swift-macos` (macos-15) | **`swift test` and `swift build -c release` pass** — see [The macOS half](#the-macos-half) |
 | Plugin build steps | `swift build -c release && .build/release/herdr-voice install-command` | both exit 0, launcher at `~/.local/bin/herdr-voice` |
 
-The 200 tests are the package's own suite plus the 10 added for this port's frame reassembly (the wire goldens,
+The 203 tests are the package's own suite plus the 13 added for this port's frame reassembly and lock/geometry seams (the wire goldens,
 which pin the exact JSON sent to each provider, the tool-schema digest, the speech gate, the confirmation gate, the
 reconnect backoff, the pane-layout reading, the window-pinning decisions, and now the text-frame assembler). They
 run on Linux, which is what makes the shared half trustworthy rather than merely compiling.
@@ -150,9 +151,9 @@ From the stub's own report (`/tmp/voice-loop-evidence/stub.json`):
 |---|---|
 | The app connected and opened a session | `connected: 1` |
 | `session.update` with instructions and tools | `session_updates: 1`, 4 922 instruction chars, **30 tools offered** |
-| Microphone audio reached the wire | **170 frames, 163 200 bytes** (3.4 s of 20 ms 24 kHz PCM16), first frame at 1.332 s |
+| Microphone audio reached the wire | **174 frames, 167 040 bytes** (3.5 s of 20 ms 24 kHz PCM16) |
 | A real Herdr tool ran and its output came back | `tool_outputs: 1` — a live `list_agents` payload as `function_call_output` |
-| Esc interrupted the reply | `truncates: 2` — `item_0 audio_end_ms 400` (barge-in), `item_1 audio_end_ms 1700` (**Esc**, count 1 → 2) |
+| Esc interrupted the reply | `truncates: 2` — `item_0 audio_end_ms 600` (barge-in), `item_1 audio_end_ms 1600` (**Esc**, count 1 → 2) |
 | The orb was on screen during playback | override-redirect 96×96 ARGB window, screenshot taken mid-playback |
 | No decode failures | **0** `undecodable event` lines in the app log |
 
@@ -202,9 +203,11 @@ Measured here with `scripts/local-keepalive-check`, which drives the real helper
 | Scenario | Result |
 |---|---|
 | Quiet session, 120 s | 10 PASS: one `● connected`, no reconnect, no relaunch, helper alive, socket still established |
-| Helper drops two keepalives (fault injection) | 16 PASS: the drop was noticed, the **same** helper pids survived (`3371296 3371311`), zero relaunches, one line for the miss, orb red then blue, keepalives resumed |
-| Helper killed with `SIGKILL` | 14 PASS: one relaunch, new pids (`3373115 3373130` → `3373463 3373477`), models reloaded, `● connected` still once, orb red then blue |
+| Helper stalls a keepalive (fault injection) | 10 PASS: the miss was noticed, the **same** helper pids survived, zero relaunches, one line for the miss, orb red then blue, keepalives resumed |
+| Helper killed with `SIGKILL` | 10 PASS: one relaunch, new pids, models reloaded, `● connected` still once, orb red then blue, no chatter about the reload |
 | Quit after either case | no orphaned Electron process, no app left running |
+
+Together that is **30 checks, 0 failures** on the final tree.
 
 ## What is not proven
 
@@ -228,7 +231,7 @@ Measured here with `scripts/local-keepalive-check`, which drives the real helper
     ./scripts/linux-x11-check                # window tracking, hide/restore, polling rate, hotkeys, conflicts
     ./scripts/linux-orb-check                # the orb's presented pixels, from its window and from the root
     ./scripts/linux-voice-loop-check         # the full loop against the local protocol stub
-    swift test                               # 200 tests
+    swift test                               # 203 tests
 
 ## Measured results (final run on this machine)
 
@@ -237,10 +240,11 @@ Swift 6.0.3. All audio was routed to a null sink (`PULSE_SINK=hv_null`) so nothi
 
 | Area | Check | Result |
 |---|---|---|
-| Package | `swift test` | **200 tests passed** (190 original + 10 for the frame reassembler) |
+| Package | `swift test` | **203 tests passed** |
 | Package | `swift build -c release` | green |
+| Package | CI `swift-macos` (macos-15) | **`swift test` + `swift build -c release` pass** on Apple silicon |
 | Session loop | `./scripts/linux-voice-loop-check` | **19 passed, 0 failed** |
-| Session loop | mic audio on the wire | **162 frames / 155,520 bytes** of real microphone PCM16 |
+| Session loop | mic audio on the wire | **174 frames / 167,040 bytes** of real microphone PCM16 |
 | Session loop | tool round trip | real `list_agents` output returned as `function_call_output` |
 | Session loop | Esc interrupt | 2 × `conversation.item.truncate` |
 | Session loop | decoding | **0** undecodable events after frame reassembly |
@@ -294,6 +298,44 @@ provider endpoint is the only step that needs a key, and it is the same code pat
    20 s. Liveness is now an application-level `heartbeat` the helper answers synchronously: 5 s cadence, two misses
    before death, and a 0.2/0.5/1 s socket retry that keeps the warm models. Only a helper process that is really gone
    is relaunched, and neither path leaves an Electron process behind.
+
+6. **The voice transcribed itself and then went permanently silent.** The assistant's own speech came back through
+   the headset microphone; the helper transcribed it as user input (`userTranscript("Beep!")` right after an onset
+   with `speaking=true`), and every such onset started a new microphone utterance. A new utterance bumps the wire's
+   epoch, and the helper then rejects the tool result the in-flight turn is waiting for as stale — so after any tool
+   call the model waits forever while the voice is silent. A pending reply no longer lets an onset open a new
+   utterance, quiet audio arriving while the assistant is audible stays on the machine, and the microphone path
+   compares against the canceller's own estimate. A real barge-in still cancels: the assistant being audible means the
+   turn is not pending, so the onset is honoured.
+7. **Noise could cancel a reply.** Any onset while a reply was streaming cancelled it, so a cough, a door, or the tail
+   of the assistant's own voice truncated the answer. Only an onset that genuinely beats the echo estimate cancels now.
+8. **The default capture device could be a loopback.** PipeWire hands out a sink's `.monitor` as a source when the last
+   real input disappears, and capturing it makes the app hear its own playback and howl — the operator hit exactly
+   that, an endless tone in the headphones. A monitor, `aloop` or ALSA `Loopback` name is never chosen by default; the
+   app picks a real capture device and says so, and honours a loopback only when it is named explicitly in
+   `HERDR_VOICE_INPUT_DEVICE`.
+9. **A named-but-missing device fell back silently.** A `HERDR_VOICE_INPUT_DEVICE`/`HERDR_VOICE_OUTPUT_DEVICE` that
+   matched nothing used to be dropped, so a run that meant to play into a null sink played to the speakers, and a
+   typo'd microphone name picked a different one with nothing said. The fallback is named in a warning now.
+
+### The macOS half
+
+The two platform halves share one package and one portable core, and the AppKit half is excluded from the Linux
+build — so nothing on this machine compiles it. That made it easy to break without noticing, and it was broken: all
+twenty CI runs on this branch failed in the `swift-macos` job, and the handoff note that accompanied them read the
+failure as "no Mac available". Two real defects were behind it, both introduced by the port and both invisible from
+Linux:
+
+- `UnfairLock` kept its `os_unfair_lock` in a stored property called `lock` *and* declared `func lock()`. Darwin's
+  overlay rejects that pair as an invalid redeclaration; Linux never saw it because its branch keeps its mutex in
+  `mutex`.
+- `WindowPin.Window.frame` moved to the portable `Rect` so the pinning decisions could be tested off Apple platforms,
+  but `WindowTracker` still declared `CGRect?` and passed a `CGRect` straight to the core.
+
+Both are fixed, and the `swift-macos` CI job (macos-15, Apple silicon) now runs `swift test` and
+`swift build -c release` green — the first passing macOS run on this branch. That is what turns "one package, two
+platform halves" from an intention into a verified claim. CI covers it from here; a human on a Mac has still not run
+the app itself.
 
 An earlier run of the helper did fail with Dawn's `vkAllocateMemory failed with VK_ERROR_OUT_OF_DEVICE_MEMORY`.
 That turned out to be GPU contention while several Electron/Chromium processes were running at once, not a limit:
