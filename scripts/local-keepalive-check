@@ -46,6 +46,11 @@ cleanup() {
     [ -n "$app_pid" ] && kill "$app_pid" 2>/dev/null
     pkill -x herdr-voice 2>/dev/null
     pkill -f '[d]ist/main[.]mjs' 2>/dev/null
+    # SIGTERM runs a real shutdown (close the session, take the Electron helper down), so the process is still alive
+    # for a moment after the kill. Starting the next scenario without waiting made the new app find the single-instance
+    # flock still held and exit with "herdr-voice is already running", which reads as "the app never connected" and is
+    # not a product failure. Wait for it to actually go.
+    for _ in $(seq 1 120); do pgrep -x herdr-voice >/dev/null 2>&1 || break; sleep 0.1; done
     # Never leave the null sink behind: an orphaned module can outlive the run and, once its source disappears,
     # PipeWire may re-point it at a real sink's own monitor - which is an endless feedback tone in the operator's
     # headphones, not a theoretical risk (it happened).
@@ -117,8 +122,14 @@ if [ "$wanted" = all ] || [ "$wanted" = quiet ]; then
         [ "$(count '● connected')" -eq 1 ] && ok "● connected appears once" || no "● connected appears $(count '● connected') times"
         kill -0 "$app_pid" 2>/dev/null && ok "the app is still running" || no "the app is no longer running"
         [ -n "$(helper_pids)" ] && ok "the helper is still alive ($(helper_pids))" || no "the helper is gone"
-        ss -tnpH state established 2>/dev/null | grep -q "pid=$app_pid," \
-            && ok "the app still holds an established socket to the helper" || no "the app holds no established socket"
+        # A sample can land while the socket is being replaced, so sample with a short retry rather than once: a
+        # single miss used to fail this check on a run whose log showed no reconnect at all.
+        held=""
+        for _ in $(seq 1 20); do
+            ss -tnpH state established 2>/dev/null | grep -q "pid=$app_pid," && { held=yes; break; }
+            sleep 0.25
+        done
+        [ -n "$held" ] && ok "the app still holds an established socket to the helper" || no "the app holds no established socket"
     fi
 fi
 
