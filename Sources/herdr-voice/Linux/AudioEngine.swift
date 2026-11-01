@@ -186,6 +186,10 @@ final class AudioEngine {
         }
         deviceRate = rate
         framesPerChunk = Int(rate * Audio.chunkSeconds)
+        // Name both devices, always. Selection is otherwise invisible: a run that meant to use a virtual microphone but
+        // silently opened the room reads exactly like one that worked, and "it hears me but says nothing" has been
+        // investigated twice already without being able to tell which device a run actually bound.
+        log("● audio: capturing from \"\(input.name)\", playing to \"\(output.name)\" at \(Int(rate)) Hz")
         guard let capture = AudioResampler(inputRate: rate, outputRate: Audio.rate),
               let reference = AudioResampler(inputRate: rate, outputRate: Audio.rate),
               let playback = AudioResampler(inputRate: Audio.rate, outputRate: rate) else {
