@@ -78,6 +78,10 @@ final class Orb {
     private var frameBody: (() -> Frame)?
     private var frameRequestOutstanding = false
     private let ready = DispatchSemaphore(value: 0)
+    /// Set by `stop()`: the frame thread leaves after the frame it is on, so the process never tears down the X
+    /// libraries underneath a thread that is still drawing with them.
+    private var stopping = false
+    private let finished = DispatchSemaphore(value: 0)
 
     // Owned by the frame thread.
     private var thread: Thread?
@@ -128,8 +132,23 @@ final class Orb {
         lock.lock()
         frameBody = frame
         lock.unlock()
-        // With a stubbed audio backend the demo's own start fails and exits; keep this branch's demo on screen.
-        OrbDemo.armExitBridge()
+    }
+
+    /// Asks the frame thread to finish, and returns once it is off the X connection.
+    ///
+    /// Called only on the way out of the process. It matters because the orb's thread is a live Xlib client: `exit()`
+    /// runs the destructors of the `dlopen`ed libraries, and a thread still inside Xlib at that moment is how the exit
+    /// path used to jump to a garbage address (`swarm-i9f.18`). The loop wakes at least every 100 ms, so this never
+    /// waits long.
+    func stop() {
+        lock.lock()
+        let running = thread != nil && !stopping
+        stopping = true
+        lock.unlock()
+        // The frame thread signals `finished` from a `defer`, so this returns at once if it never reached the loop
+        // (no X display, no window) and within one wake if it did.
+        guard running else { return }
+        _ = finished.wait(timeout: .now() + 2)
     }
 
     /// Sits just inside the bottom-left of `window` (X11 coordinates, top-left origin), or hides when nil.
@@ -162,6 +181,7 @@ final class Orb {
     // MARK: - frame thread
 
     private func startFrameThread() {
+        defer { finished.signal() }
         guard let x = OrbX11() else {
             log("✖ orb: no X display is reachable; the orb is not available")
             ready.signal()
@@ -191,13 +211,12 @@ final class Orb {
         // Watch what the window manager raises above managed windows; the orb puts itself back on top of them.
         XSelectInput(x.display, x.root, X11.substructureNotifyMask)
         applyPlacement(force: true)
-        OrbDemo.orbOnScreen = true
         ready.signal()
 
         var last = Orb.now()
         var lastWatchdog = last
         var lastDebugLog = last
-        while true {
+        while !isStopping {
             let frameStart = Orb.now()
             pumpEvents()
             requestFrame()
@@ -256,6 +275,12 @@ final class Orb {
                 if let menu, menu.isOpen, menu.needsPaint { menu.paint() }
             }
         }
+    }
+
+    private var isStopping: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopping
     }
 
     private func currentInputs() -> Inputs {

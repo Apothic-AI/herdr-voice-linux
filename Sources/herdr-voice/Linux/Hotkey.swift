@@ -30,6 +30,12 @@ enum Hotkey {
         server.setStopKey(active: active, onPress)
     }
 
+    /// Closes the grab connection's thread on the way out of the process, so nothing is inside Xlib when the C
+    /// library finalises it. Released grabs are the X server's job once the connection is gone.
+    static func stop() {
+        server.stop()
+    }
+
     /// The binding the environment asks for. `ctrl+alt` and `m` are the Linux default: ⌥⌘M is taken by the
     /// window manager on most desktops, and Ctrl+Alt+M is free on GNOME, KDE and XFCE alike.
     static func binding() -> (label: String, modifiers: UInt32, keyName: String) {
@@ -82,6 +88,10 @@ private final class X11Hotkeys {
         muteHandler = onPress
         start()
         grabMute()
+    }
+
+    func stop() {
+        loop.stop()
     }
 
     func setStopKey(active: Bool, _ onPress: @escaping () -> Void) {

@@ -60,6 +60,12 @@ final class WindowTracker {
         loop.start()
     }
 
+    /// Asks the loop thread to close its display and finish. Called only on the way out of the process, so that no
+    /// thread is still inside Xlib when the C library finalises it.
+    func stop() {
+        loop.stop()
+    }
+
     /// On the loop thread, once the display is open: intern the atoms and start listening for the window manager
     /// telling us that the managed windows changed.
     private func open(_ display: OpaquePointer) -> Bool {

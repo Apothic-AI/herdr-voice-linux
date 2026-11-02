@@ -42,7 +42,11 @@ count() { grep -c "$1" "$log" 2>/dev/null || true; }
 # `[d]ist/main[.]mjs` cannot match this shell, whose command line never contains that text.
 helper_pids() { pgrep -f '[d]ist/main[.]mjs' 2>/dev/null | sort -n | tr '\n' ' '; }
 
-cleanup() {
+# Stops the app and its helper. Deliberately does NOT unload the null sink: `start_app` needs it to survive from
+# scenario 0, and this used to be part of `cleanup`, so the first `start_app` of a run removed the sink it was about to
+# ask the app to play to. Every run that had no sink left over from an earlier run therefore failed on the app choosing
+# the real default device — the check was silently depending on a stale sink from a previous, interrupted run.
+stop_app() {
     [ -n "$app_pid" ] && kill "$app_pid" 2>/dev/null
     pkill -x herdr-voice 2>/dev/null
     pkill -f '[d]ist/main[.]mjs' 2>/dev/null
@@ -51,11 +55,16 @@ cleanup() {
     # flock still held and exit with "herdr-voice is already running", which reads as "the app never connected" and is
     # not a product failure. Wait for it to actually go.
     for _ in $(seq 1 120); do pgrep -x herdr-voice >/dev/null 2>&1 || break; sleep 0.1; done
+    app_pid=""
+    return 0
+}
+
+cleanup() {
+    stop_app
     # Never leave the null sink behind: an orphaned module can outlive the run and, once its source disappears,
     # PipeWire may re-point it at a real sink's own monitor - which is an endless feedback tone in the operator's
     # headphones, not a theoretical risk (it happened).
     [ -n "${sink_module:-}" ] && pactl unload-module "$sink_module" 2>/dev/null
-    app_pid=""
     return 0
 }
 trap cleanup EXIT
@@ -72,7 +81,7 @@ wait_log() {
 }
 
 start_app() {
-    cleanup
+    stop_app
     log="$evidence/$1.log"
     shift
     # Output is named as a PortAudio device, not via PULSE_SINK: the app chooses its output with
@@ -215,12 +224,30 @@ fi
 
 if [ "$wanted" = all ] || [ "$wanted" = exit ] || [ "$wanted" = killed ] || [ "$wanted" = socket ]; then
     say "== 5. quitting leaves nothing behind =="
+    # Run on its own (`./scripts/local-keepalive-check exit`) this scenario has no app, because only scenarios 2-4
+    # start one. Without this it asserted "no orphaned Electron process" and "no app left running" about a pid that
+    # never existed, so it passed on an empty run and the SIGTERM segfault went unseen. Start one here when the
+    # earlier scenarios did not.
+    if [ -z "$app_pid" ] || ! kill -0 "$app_pid" 2>/dev/null; then
+        start_app exit || exit 1
+    fi
     kill "$app_pid" 2>/dev/null
+    gone=""
     for _ in $(seq 1 80); do
-        ! kill -0 "$app_pid" 2>/dev/null && [ -z "$(helper_pids)" ] && break
+        ! kill -0 "$app_pid" 2>/dev/null && { gone=yes; break; }
         sleep 0.25
     done
+    [ -n "$gone" ] || { no "the app did not exit within 20 s of SIGTERM"; kill -9 "$app_pid" 2>/dev/null; }
+    # The status is the point of this scenario: the app handles SIGTERM, so 0 is the contract. 139 is the segfault in
+    # the shutdown path that passed here for weeks because nothing looked at how the process died.
+    wait "$app_pid" 2>/dev/null
+    status=$?
     app_pid=""
+    [ "$status" -eq 0 ] && ok "the app exited 0 on SIGTERM" \
+        || no "the app exited $status on SIGTERM (139 is the SIGSEGV in the shutdown path)"
+    grep -qE 'Signal 11|Bad pointer dereference|Program crashed' "$log" 2>/dev/null \
+        && no "the app crashed while quitting: $(grep -m1 -E 'Signal 11|Bad pointer dereference' "$log")" \
+        || ok "no crash report in the app log"
     [ -z "$(helper_pids)" ] && ok "no orphaned Electron process after the app exited" \
         || no "orphaned Electron processes left: $(helper_pids)"
     pgrep -x herdr-voice >/dev/null 2>&1 && no "the app is still running" || ok "no app left running"

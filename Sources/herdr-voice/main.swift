@@ -101,6 +101,37 @@ if args.count > 1, args[1] == "tool" {
 // activation policy and the orb never takes focus, so it does nothing.
 AppHost.prepareForLaunch()
 
+/// Stops every thread that is inside a library the C runtime finalises, then leaves.
+///
+/// The order is the point. Linux reaches X11 and PortAudio through `dlopen`, and `exit()` finalises those libraries; a
+/// thread still inside one at that moment is exactly how this process used to jump to a garbage address on SIGTERM.
+/// The crash report's own thread list had the X11 loop thread alive at the moment of the jump, with
+/// `libasound_module_pcm_speex` on the stack (`swarm-i9f.18`). Stopping each owner first means nothing is inside a
+/// library when it is finalised. The `#if` is the whole platform difference: AppKit and AVFoundation are linked, not
+/// `dlopen`ed, so on macOS there is no such teardown running underneath a live thread.
+func stopOwners() {
+    #if os(Linux)
+    session.audio.stop() // PortAudio's callbacks end before its library is finalised
+    windowTracker.stop() // each X11 loop closes its own connection, on its own thread
+    Hotkey.stop()
+    orb.stop()
+    #endif
+}
+
+/// Closes the billable session, stops the threads that own native libraries, takes the Electron host down, then leaves.
+/// `localRuntime.stop()` is last because reaping the helper is the slowest step and it must not delay the socket close
+/// and the audio release ahead of it.
+func shutDown(_ code: Int32) -> Never {
+    session.shutdown()  // close the provider socket: billing stops now, and no audio egress is left open
+    stopOwners()
+    localRuntime.stop() // SIGTERM the Electron host and reap it, so no orphan is left holding the GPU
+    exit(code)
+}
+
+// Kept alive for the life of the process: a dispatch source that goes out of scope stops delivering, and this one
+// only exists to catch ctrl+c.
+var demoSources: [DispatchSourceSignal] = []
+
 // --orb-demo: orb only, driven by the live mic, cycling moods every 4s. No network, no key.
 if args.contains("--orb-demo") {
     let audio = Audio()
@@ -124,9 +155,29 @@ if args.contains("--orb-demo") {
         let thinking = mood == .working || (moods[(phase + 1) % moods.count] == .speaking && t > 2.5)
         return Orb.Frame(mood: mood, mic: audio.micLevel, voice: audio.isSpeaking ? audio.outLevel : 0, thinking: thinking)
     }
-    do { try audio.start() } catch { log("✖ audio: \(error.localizedDescription)"); exit(1) }
+    do {
+        try audio.start()
+    } catch {
+        // A stubbed or unavailable audio backend is not a reason to take the demo off the screen: the orb is the thing
+        // being demoed, and `OrbDemo.levels` supplies its own envelopes once no level arrives. This used to `exit(1)`
+        // here and hold the process open from an `atexit` handler, which then swallowed every later exit — including
+        // ctrl+c — because that handler ran a CFRunLoop that never returns.
+        log("⚠ orb demo: \(error.localizedDescription); the orb keeps drawing with synthesised levels")
+    }
     log("orb demo: talk to see it react; ctrl+c to quit")
-    signal(SIGINT) { _ in exit(0) }
+    // A dispatch source, not a `signal` handler: the stop below closes the audio device and the X connection, and only
+    // a real thread may do that. Ignoring the signal first is what lets the dispatch source receive it.
+    signal(SIGINT, SIG_IGN)
+    let stopDemo = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    stopDemo.setEventHandler {
+        #if os(Linux)
+        audio.stop()
+        orb.stop()
+        #endif
+        exit(0)
+    }
+    stopDemo.resume()
+    demoSources.append(stopDemo)
     AppHost.runMainLoop()
 }
 
@@ -247,10 +298,9 @@ func modelChoices() -> [Orb.MenuChoice] {
     }
 }
 let orb = Orb(onClick: { session.toggleMute() }, menuChoices: modelChoices, onQuit: {
+    // A moment for the WebSocket close frame to go out, then the same ordered stop a signal gets.
     session.shutdown()
-    localRuntime.stop()
-    // A moment for the WebSocket close frame to go out.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(0) }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { shutDown(0) }
 })
 Hotkey.registerMute { session.toggleMute() }
 
@@ -261,11 +311,7 @@ var signalSources: [DispatchSourceSignal] = []
 for sig in [SIGTERM, SIGINT, SIGHUP] {
     signal(sig, SIG_IGN)
     let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-    source.setEventHandler {
-        session.shutdown()
-        localRuntime.stop()
-        exit(0)
-    }
+    source.setEventHandler { shutDown(0) }
     source.resume()
     signalSources.append(source)
 }
@@ -313,16 +359,15 @@ do {
     try session.start()
 } catch {
     log("✖ audio: \(error.localizedDescription) — allow microphone access for your terminal in System Settings")
-    exit(1)
+    shutDown(1)
 }
 if provider == .local {
     log("◌ loading Local OpenLive WebGPU speech models")
     loadLocal { error in
         FileHandle.standardError.write(Data("Local OpenLive failed: \(error.localizedDescription)\nNo cloud fallback was selected.\n".utf8))
-        exit(2)
+        shutDown(2)
     }
 }
-signal(SIGINT) { _ in exit(0) }
 AppHost.runMainLoop()
 
 /// 220 Hz with a wandering pitch, amplitude-shaped into ~4 "syllables" a second, as base64 PCM16 24 kHz.
