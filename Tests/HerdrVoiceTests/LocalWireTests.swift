@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import Testing
 @testable import HerdrVoiceCore
@@ -79,6 +78,20 @@ private func json(_ objects: [[String: Any]]) -> String {
     #expect(wire.encode(.audioPaused).isEmpty)
 }
 
+@Test func audioAfterACommitIsDroppedRatherThanAppendedToTheClosedUtterance() {
+    let wire = LocalWire()
+    _ = wire.encode(.inputStarted(utteranceID: "u1"))
+    #expect(json(wire.encode(.audioPaused)) == json([["type": "input.commit", "utterance_id": "u1", "epoch": 1]]))
+    // The helper answers a frame for a committed utterance with "unknown microphone utterance", so the frame must not
+    // be sent at all. The next utterance begins with input.begin, and nothing arrives ahead of it.
+    #expect(wire.encode(.appendAudio("QUJD")).isEmpty)
+    #expect(wire.encode(.audioPaused).isEmpty)
+    #expect(json(wire.encode(.inputStarted(utteranceID: "u2")))
+        == json([["type": "input.begin", "utterance_id": "u2", "epoch": 2]]))
+    #expect(json(wire.encode(.appendAudio("QUJD")))
+        == json([["type": "input.append", "utterance_id": "u2", "epoch": 2, "audio": "QUJD"]]))
+}
+
 @Test func localWireRejectsInjectedAndLateTranscripts() {
     let wire = LocalWire()
     _ = wire.encode(.inputStarted(utteranceID: "real"))
@@ -119,6 +132,15 @@ private func json(_ objects: [[String: Any]]) -> String {
     ]]
     let data = try! JSONSerialization.data(withJSONObject: fixture, options: [.sortedKeys, .withoutEscapingSlashes])
     #expect(String(decoding: data, as: UTF8.self).contains("and/or patch/12 ~/dev/app"))
-    let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    let digest = SHA256.hex(data: data)
     #expect(digest == "aa1900e9b7b626caee2c5710d503b7f575eff8a3204b3150d030e7fc37bd2092")
+}
+
+@Test func theHelperAnswersTheKeepaliveOutsideAnyEpoch() {
+    // A keepalive answer is about the socket, not a turn, so it must decode before the epoch guard: the app can be
+    // waiting on it while no turn has an epoch yet. `heartbeat.ack` was previously swallowed as `.ignored`.
+    let wire = LocalWire()
+    #expect(wire.decode(#"{"type":"heartbeat.ack"}"#) == [.heartbeatAck])
+    #expect(wire.decode(#"{"type":"heartbeat.ack","epoch":99}"#) == [.heartbeatAck])
+    #expect(LocalWire.heartbeat["type"] as? String == "heartbeat")
 }

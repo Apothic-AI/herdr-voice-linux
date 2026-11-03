@@ -5,7 +5,7 @@ I really like ChatGPT's voice agent and decided to create a version that would r
 
 **Talk to the coding agents in your [Herdr](https://herdr.dev) panes, and hear them talk back.**
 
-herdr-voice is a macOS plugin for Herdr. Local OpenLive or a realtime cloud model from xAI, OpenAI, or Google
+herdr-voice is a Herdr plugin for macOS and Linux. Local OpenLive or a realtime cloud model from xAI, OpenAI, or Google
 understands your speech. It hands the work to the Claude Code or Codex agent in a Herdr pane and tells you when the
 agent finishes or needs approval. A glowing orb in the corner of your screen shows who is talking.
 
@@ -70,9 +70,40 @@ voice: Done. 42 tests pass; it fixed a null check in the login handler.
 | | |
 |---|---|
 | macOS | 14 Sonoma or later (developed on macOS 26) |
-| Swift | 5.10 or later: Xcode, or the Xcode Command Line Tools (`xcode-select --install`) |
+| Linux | X11 (Wayland works through XWayland), with Swift, Xlib, Cairo and PortAudio — see [Linux](#linux) |
+| Swift | 5.10 or later: Xcode or the Command Line Tools on macOS; `swiftlang` on Linux |
 | Herdr | 0.9.0 or later |
 | Provider | Local OpenLive with WebGPU and Ollama, or an xAI, OpenAI, or Google API key |
+
+### Linux
+
+The orb, the microphone, the global hotkeys and the window pinning are implemented against X11, Cairo and PortAudio
+rather than AppKit, AVFoundation and Carbon. Everything else — the voice session, the Herdr tools, the confirmation
+gate, Local OpenLive — is the same code as on macOS.
+
+```bash
+# Debian/Ubuntu (Debian 13 ships Swift 6 as `swiftlang`)
+sudo apt install swiftlang libx11-dev libxrender-dev libcairo2-dev portaudio19-dev
+# Fedora: sudo dnf install swift-lang libX11-devel libXrender-devel cairo-devel portaudio-devel
+# Arch:   sudo pacman -S swift libx11 libxrender cairo portaudio
+
+herdr plugin install brogrammerMW/herdr-voice
+herdr-voice setup grok      # or: local, openai, gemini
+herdr-voice
+```
+
+What is different on Linux, and why:
+
+- **The mute hotkey is `Ctrl+Alt+M`** instead of `⌥⌘M` (there is no ⌥⌘ on Linux). Override it with
+  `HERDR_VOICE_HOTKEY_KEY` and `HERDR_VOICE_HOTKEY_MODS`. Esc is still grabbed only while the voice is speaking.
+- **API keys** go to the Secret Service (GNOME Keyring, KWallet) when one is reachable, and otherwise to a private
+  0600 file under `$XDG_CONFIG_HOME/herdr-voice/secrets`. `HERDR_VOICE_KEYRING` forces a backend.
+- **`run_shell`** runs in `$SHELL` rather than always `/bin/zsh`.
+- **Echo cancellation** uses the system's echo-cancel source when one exists and the app's own adaptive canceller
+  otherwise, so the mic can stay open while the voice speaks.
+
+The full port notes — what replaced what, and how each piece was verified — are in
+[docs/linux-port.md](docs/linux-port.md).
 
 ## Local OpenLive quick start
 
@@ -100,7 +131,8 @@ hybrid keyed-brain settings, failure behavior, demos, tool examples and benchmar
 
 **What to expect.** While the speech models load (about 20 seconds once cached, a few minutes the first time) the
 orb is amber with the thinking bubble; it turns blue when the voice is listening. If the speech helper crashes,
-herdr-voice relaunches it and reconnects on its own, in about 5 seconds. Local mode answers in roughly two
+herdr-voice relaunches it and reconnects on its own, in about 5 seconds; a connection that merely drops is redialed to
+the same helper without paying that warm-up again. Local mode answers in roughly two
 seconds after you stop talking, slower than Grok; it's the choice for privacy, working offline, and no per-minute
 audio fees, not for speed. The default brain is Qwen 3.5 4B; for better answers at some speed cost, set
 `HERDR_VOICE_LOCAL_BRAIN_MODEL=qwen3.5:9b` (after `ollama pull qwen3.5:9b`).
@@ -138,15 +170,19 @@ Then, in any Herdr pane:
    Switching keeps the conversation going with the new model. To change the voice itself (Rex, Eve, ...), set
    `HERDR_VOICE_VOICE` in the settings file below.
 
-4. **Give it a key** (optional), in Herdr's `config.toml`:
+4. **Give it a key** (optional), in Herdr's `config.toml` (`herdr server reload-config` applies it):
 
    ```toml
    [[keys.command]]
-   key = "prefix+v"
+   key = "prefix+m"
    type = "plugin_action"
    command = "brogrammermw.herdr-voice.start"
    description = "start herdr-voice"
    ```
+
+   Pick a key nothing else in your `config.toml` already binds: the file is a list of `[[keys.command]]` entries,
+   and a key you have already given to another plugin will not start the voice. `herdr config reset-keys` backs the
+   file up and clears the custom bindings if you need to start over.
 
 If your shell says `herdr-voice: command not found`, `~/.local/bin` isn't on your `PATH`: add
 `export PATH="$HOME/.local/bin:$PATH"` to your `~/.zshrc`.
@@ -154,7 +190,8 @@ If your shell says `herdr-voice: command not found`, `~/.local/bin` isn't on you
 **Settings** live in `config.env` in the plugin's config folder (`herdr plugin config-dir brogrammermw.herdr-voice`),
 created on first start with every option commented out. It takes the `HERDR_VOICE_*` settings from
 [Configuration](#configuration), one `NAME=value` per line; restart the voice to apply them. API keys are refused
-there on purpose: they belong in the Keychain.
+there on purpose: they belong in the platform secret store (the Keychain on macOS, the Secret Service or a
+private key file on Linux), never in a plain settings file.
 
 **Before you install,** know what it does (Herdr doesn't review plugins): it builds with `swift build`, listens to
 your microphone while unmuted, streams your speech to the AI provider you chose, reads your agents' terminals to
@@ -287,7 +324,7 @@ thing, the voice asks which one you mean instead of guessing.
 
 | Control | Action |
 |---|---|
-| `⌥⌘M`, or click the orb | Mute or unmute the mic, from any app. When disconnected, reconnects instead |
+| `⌥⌘M` on macOS, `Ctrl+Alt+M` on Linux, or click the orb | Mute or unmute the mic, from any app. When disconnected, reconnects instead |
 | Right-click (or control-click) the orb | Menu: **Show voice pane** unzooms the tab so the voice's transcript is in view; **Hide voice pane** zooms the pane above it again; the model entries switch the AI model (**Grok**, **GPT**, **Gemini**; the current one is checked, models without an API key are greyed out), which carries the conversation over to the new model, or **Quit herdr-voice**, which closes the provider session and exits |
 | `Esc` while the voice is talking | Stop it and cancel the rest of the reply |
 | Talk over the voice | Stop it and listen to you (only when your mic actually heard you, so echo and noise don't cut it off) |
@@ -301,8 +338,8 @@ use while muted.
 
 ### Where the orb shows
 
-The orb is pinned to the terminal window running Herdr (Terminal, iTerm, Ghostty, and so on), just inside its
-bottom-left corner, and follows it when you move or resize it. It **stays visible when you click into another app
+The orb is pinned to the terminal window running Herdr (Terminal, iTerm, Ghostty, gnome-terminal, and so on),
+just inside its bottom-left corner, and follows it when you move or resize it. It **stays visible when you click into another app
 or another window**: focus doesn't matter, it floats above them on the Herdr window's corner. It hides only when the
 Herdr window itself isn't shown:
 
@@ -576,7 +613,7 @@ Want the details? Ask it to show you the agent's pane ("show me claude-2") and r
 
 ```bash
 swift build          # debug build
-swift test           # 190 tests: local mode (wire, state directory, warm-up, relaunch, menu), plugin config and single-instance lock, starting agents, pane reading and watching, workspace/tab/worktree management, key setup, events, wire protocols (golden OpenAI/Grok messages, Gemini Live), Herdr tools, focus, confirmations, injection gates, shell, speech policy, activity, window pinning, reconnect, keychain, speech gate, reply scheduling, report condensing, stop phrases, model menu
+swift test           # 203 tests: local mode (wire, state directory, warm-up, relaunch, menu), plugin config and single-instance lock, starting agents, pane reading and watching, workspace/tab/worktree management, key setup, events, wire protocols (golden OpenAI/Grok messages, Gemini Live), Herdr tools, focus, confirmations, injection gates, shell, speech policy, activity, window pinning, reconnect, keychain, speech gate, reply scheduling, report condensing, stop phrases, model menu
 swift build -c release
 herdr plugin link "$PWD"   # try your working copy as the plugin (link doesn't build: run swift build -c release first)
 ```
@@ -669,7 +706,8 @@ delta, the process scan (0.4 ms every 2 s), and `herdr` CLI calls (under 10 ms e
 | `herdr-voice: command not found` | Add `~/.local/bin` to your `PATH` (see [Quick start](#quick-start)), or run `.build/release/herdr-voice` from the clone |
 | A model is greyed out in the orb's menu | Local OpenLive isn't set up yet: run `scripts/local-openlive-setup`. Any other model has no key yet: `herdr-voice setup openai` or `herdr-voice setup gemini` in another terminal; the menu picks it up next time you open it |
 | `⚠ could not register ⌥⌘M` | Another app owns that shortcut. Set `HERDR_VOICE_HOTKEY_KEYCODE`, or click the orb to mute |
-| `↻ …reconnecting` in the log | Normal: the session ended (idle or time limit) or the network dropped; it reconnects by itself (1 → 30 s backoff) |
+| `↻ …reconnecting` in the log | Normal: the session ended (idle or time limit) or the network dropped; it reconnects by itself (1 → 30 s backoff). In Local mode a reconnect is silent unless the helper had to be relaunched |
+| The orb is red (offline) | The session is not live: reconnecting, or waiting for you to unmute. It turns blue again the moment the session is back |
 | `✖ …gave up after 8 tries` / red orb | Repeated failures, usually a wrong or revoked key or no network. Fix that, then press `⌥⌘M` |
 | `⚠ not inside a Herdr pane` | Start it from a Herdr pane so it controls the right session |
 | The voice hears itself | Echo cancellation needs the default input/output devices; use headphones if your speakers are very loud (and make sure `HERDR_VOICE_ECHO_CANCEL` isn't `0`) |

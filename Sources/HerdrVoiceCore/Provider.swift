@@ -1,10 +1,19 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public enum Provider: String, CaseIterable {
     case local, openai, grok, gemini
 
     public var url: URL {
-        switch self {
+        // HERDR_VOICE_URL points the session at another endpoint — a proxy, a self-hosted gateway, or the local
+        // stub the Linux port's end-to-end check drives. Unset, every provider uses its real endpoint.
+        if let override = ProcessInfo.processInfo.environment["HERDR_VOICE_URL"],
+           let url = URL(string: override), url.scheme != nil {
+            return url
+        }
+        return switch self {
         case .local: URL(string: "ws://127.0.0.1:1")!
         case .openai: URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1")!
         case .grok: URL(string: "wss://api.x.ai/v1/realtime?model=grok-voice-latest")!
@@ -59,6 +68,20 @@ public enum Provider: String, CaseIterable {
         }
     }
 
+    /// swift-corelibs-foundation builds the WebSocket handshake with `Connection: keep-alive`, which RFC 6455
+    /// forbids (it must be `Upgrade`) and strict servers reject outright. Sending the correct pair ourselves is
+    /// enough: the header survives into the request URLSession makes.
+    public static func websocketHandshakeFix(_ request: URLRequest) -> URLRequest {
+        #if canImport(Darwin)
+        return request
+        #else
+        var fixed = request
+        fixed.setValue("Upgrade", forHTTPHeaderField: "Connection")
+        fixed.setValue("websocket", forHTTPHeaderField: "Upgrade")
+        return fixed
+        #endif
+    }
+
     /// The connection request. OpenAI and xAI take the key as a bearer header. Gemini Live only accepts it as a
     /// `key` query parameter, so this URL must never be logged (nothing in herdr-voice logs URLs).
     public func request(key: String) -> URLRequest {
@@ -66,15 +89,15 @@ public enum Provider: String, CaseIterable {
         case .local:
             var request = URLRequest(url: url)
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            return request
+            return Self.websocketHandshakeFix(request)
         case .openai, .grok:
             var request = URLRequest(url: url)
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            return request
+            return Self.websocketHandshakeFix(request)
         case .gemini:
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
             components.queryItems = [URLQueryItem(name: "key", value: key)]
-            return URLRequest(url: components.url!)
+            return Self.websocketHandshakeFix(URLRequest(url: components.url!))
         }
     }
 
@@ -90,6 +113,9 @@ public enum Provider: String, CaseIterable {
     public enum KeySource: String {
         case keychain = "Keychain"
         case environment = "environment"
+
+        /// Where the key came from, named for the platform's actual store ("Keychain" only on macOS).
+        public var label: String { self == .keychain ? Keychain.storeDescription : rawValue }
     }
 
     /// The API key: the macOS Keychain first (a generic password whose service is `keyEnv`, e.g. XAI_API_KEY), then
@@ -156,60 +182,6 @@ public enum Provider: String, CaseIterable {
     /// The provider to start with when neither --provider nor HERDR_VOICE_PROVIDER says: Local OpenLive once it's set
     /// up on this Mac, otherwise Grok, so a fresh install still starts on first run.
     public static func defaultChoice(localIsBuilt: Bool) -> Provider { localIsBuilt ? .local : .grok }
-}
-
-/// Reads generic passwords from the login Keychain.
-///
-/// Goes through /usr/bin/security rather than SecItem: an item added with `security add-generic-password` trusts
-/// that tool, so reading it this way never prompts. SecItem from this unsigned binary would prompt again after
-/// every rebuild, since each build has a different code signature. The secret only travels over a private pipe:
-/// the command line carries just the service name, and stderr ("item not found") is discarded.
-public enum Keychain {
-    /// A pasted key, tidied: surrounding whitespace and quotes dropped. Nil unless what's left is only the
-    /// characters API keys use, which also keeps it safe inside the quoted `security` command below.
-    public static func cleanKey(_ raw: String) -> String? {
-        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-        guard !key.isEmpty, key.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "-_.".contains($0)) }) else { return nil }
-        return key
-    }
-
-    /// The `security -i` command line that saves (or replaces) `value`. Sent over a pipe, never as an argument,
-    /// so the key doesn't show up in the process list or shell history. `value` must come from `cleanKey`.
-    static func storeCommand(service: String, account: String, value: String) -> String {
-        "add-generic-password -U -a \"\(account)\" -s \(service) -l \"herdr-voice \(service)\" -w \"\(value)\"\n"
-    }
-
-    /// Saves a key cleaned by `cleanKey` in the login Keychain, where `password(service:)` finds it.
-    public static func store(service: String, value: String) -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["-i"]
-        let input = Pipe()
-        p.standardInput = input
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return false }
-        input.fileHandleForWriting.write(Data(storeCommand(service: service, account: NSUserName(), value: value).utf8))
-        try? input.fileHandleForWriting.close()
-        p.waitUntilExit()
-        return p.terminationStatus == 0 && password(service: service) == value
-    }
-
-    public static func password(service: String) -> String? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["find-generic-password", "-s", service, "-w"]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        p.standardInput = FileHandle.nullDevice
-        do { try p.run() } catch { return nil }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else { return nil }
-        let value = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .newlines)
-        return value.isEmpty ? nil : value
-    }
 }
 
 /// When herdr-voice starts, or the model is switched from the orb, the voice introduces itself and says it's ready.

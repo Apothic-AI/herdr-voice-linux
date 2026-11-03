@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Integrate the four lane branches onto linux-port, one at a time, stopping at the first real conflict.
+# Each lane owns a disjoint set of files, so a conflict means a lane reached outside its scope.
+set -uo pipefail
+cd /home/bitnom/Code/herdr-voice-linux || exit 1
+
+fail=0
+for lane in audio orb x11 local; do
+    branch="linux-$lane"
+    printf '== merging %s ==\n' "$branch"
+    if ! git merge --no-edit "$branch" >"/tmp/logs/merge-$lane.log" 2>&1; then
+        printf 'CONFLICT in %s:\n' "$branch"
+        git diff --name-only --diff-filter=U | sed 's/^/   /'
+        fail=1
+        break
+    fi
+    git log --oneline -1 | sed 's/^/   /'
+done
+
+if [ "$fail" -eq 0 ]; then
+    printf '== build ==\n'
+    if ! swift build 2>&1 | tail -3; then fail=1; fi
+    printf '== test ==\n'
+    if ! swift test 2>&1 | grep -E "Test run with|error:" | tail -3; then fail=1; fi
+    printf '== release build ==\n'
+    swift build -c release 2>&1 | tail -2
+fi
+exit "$fail"

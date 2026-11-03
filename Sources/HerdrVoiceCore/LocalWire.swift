@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 public struct ToolManifest: Equatable {
@@ -26,7 +25,7 @@ public extension HerdrTools {
         let names = definitions.compactMap { $0["name"] as? String }
         let data = (try? JSONSerialization.data(withJSONObject: definitions,
                                                 options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data()
-        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hex(data: data)
         return ToolManifest(
             profile: .init(name: definitions.count == 32 ? "shell32" : "base30",
                            count: definitions.count, digest: digest),
@@ -44,6 +43,12 @@ public final class LocalWire: Wire {
     private var utteranceID: String?
 
     public init() {}
+
+    /// The app's keepalive. A WebSocket pong never reaches the app on Linux — swift-corelibs-foundation writes the
+    /// ping but drops the pong callback — so socket liveness is measured with a message the helper has to answer.
+    public static let heartbeat: [String: Any] = ["type": "heartbeat"]
+    /// The helper's answer to `heartbeat`. Carries no epoch: it is about the socket, not about a turn.
+    public static let heartbeatAck = "heartbeat.ack"
 
     public func isCurrent(epoch candidate: Int) -> Bool {
         lock.withLock { candidate == epoch }
@@ -80,6 +85,11 @@ public final class LocalWire: Wire {
             return [["type": "input.append", "utterance_id": utteranceID, "epoch": epoch, "audio": audio]]
         case .audioPaused:
             guard let utteranceID else { return [] }
+            // The utterance is committed: the helper will not take another frame for it, and answering one with
+            // "unknown microphone utterance" is all it can do. Forgetting the id here is what makes the *next* gate
+            // opening start a new utterance instead of appending to a closed one - which is exactly what happened while
+            // a suppressed onset let audio through with no `input.begin` in front of it.
+            self.utteranceID = nil
             return [["type": "input.commit", "utterance_id": utteranceID, "epoch": epoch]]
         case .clearInput:
             epoch += 1
@@ -114,6 +124,8 @@ public final class LocalWire: Wire {
         lock.lock()
         defer { lock.unlock() }
         if type == "session.updated" { return [.sessionReady] }
+        // Answered before the epoch guard: the keepalive is about the socket, so it carries no epoch.
+        if type == Self.heartbeatAck { return [.heartbeatAck] }
         if type == "error", object["epoch"] == nil { return [.error(Self.errorMessage(object, fallback: text))] }
         guard let eventEpoch = object["epoch"] as? Int, eventEpoch == epoch else { return [] }
 

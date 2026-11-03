@@ -5,11 +5,23 @@ import Foundation
 extension HerdrTools {
     public static var shellEnabled: Bool { ProcessInfo.processInfo.environment["HERDR_VOICE_SHELL"] == "1" }
     public static let shellTimeout: TimeInterval = 60
+
+    /// The shell `run_shell` runs commands in: the user's own `$SHELL` when it is executable, so a Linux box
+    /// gets bash/fish/zsh as configured, otherwise the platform default.
+    public static var loginShell: String {
+        if let shell = ProcessInfo.processInfo.environment["SHELL"],
+           FileManager.default.isExecutableFile(atPath: shell) { return shell }
+        #if os(macOS)
+        return "/bin/zsh"
+        #else
+        return "/bin/sh"
+        #endif
+    }
     static let shellOutputLimit = 4000
 
     static let shellSchema = fn(
         "run_shell",
-        "Run a short shell command (zsh, no input, 60 s limit) and get its exit code and output. For quick checks the "
+        "Run a short shell command (no input, 60 s limit) and get its exit code and output. For quick checks the "
             + "developer asks for; send real coding work to an agent with prompt_agent instead. Always two calls: call "
             + "without confirmed, ask the developer, then call again with confirmed=true after they say yes.",
         ["command": str("The exact shell command"),
@@ -43,10 +55,10 @@ extension HerdrTools {
         return head + "\n" + untrusted(r.output.isEmpty ? "(no output)" : r.output)
     }
 
-    /// zsh -c with stdin closed and stdout+stderr merged. Keeps only the last `shellOutputLimit` characters.
+    /// `$SHELL -c` with stdin closed and stdout+stderr merged. Keeps only the last `shellOutputLimit` characters.
     public static let shellExec: ShellExec = { command, cwd, timeout in
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.executableURL = URL(fileURLWithPath: HerdrTools.loginShell)
         p.arguments = ["-c", command]
         p.currentDirectoryURL = URL(fileURLWithPath: cwd)
         p.standardInput = FileHandle.nullDevice

@@ -1,6 +1,6 @@
 # Local OpenLive
 
-Local OpenLive keeps the native Herdr voice loop. It uses one macOS microphone with echo cancellation, the existing
+Local OpenLive keeps the native Herdr voice loop. It uses one microphone with echo cancellation, the existing
 orb and provider switching, the same confirmation provenance, watches and recap, and the Swift `HerdrTools` executor.
 A managed Electron child binds an authenticated WebSocket only on `127.0.0.1`. Its hidden sandboxed renderer runs the
 pinned OpenLive `models.worker.ts` directly with WebGPU Whisper tiny.en fp32 and Kokoro fp32. Electron has no mic,
@@ -9,9 +9,10 @@ speaker or tool privileges. The main process uses OpenLive's pinned `streamProvi
 ## Setup and run
 
 Local mode is a one-time setup from a source checkout. Until it has run, the orb's menu shows
-**Local OpenLive (not set up)**, greyed out. Prerequisites are macOS with WebGPU, Node 22 or later, pnpm 10 or later, Ollama with `qwen3.5:4b`, and Swift
-5.10 or later. `pnpm-lock.yaml` stays exact and is installed with `--frozen-lockfile`. Keep Ollama in local-only mode
-(`OLLAMA_NO_CLOUD=1`). Then run:
+**Local OpenLive (not set up)**, greyed out. Prerequisites are a desktop with WebGPU, Node 22 or later, pnpm 10 or
+later, Ollama with `qwen3.5:4b`, and Swift 5.10 or later; [Linux prerequisites](#linux-prerequisites) lists what a
+Linux box needs beyond that. `pnpm-lock.yaml` stays exact and is installed with `--frozen-lockfile`. Keep Ollama in
+local-only mode (`OLLAMA_NO_CLOUD=1`). Then run:
 
 ```bash
 ./scripts/local-openlive-setup
@@ -27,9 +28,83 @@ exact-model brain probe. The first run downloads the model files. `local-openliv
 and repeats the inference probes. A missing asset, WebGPU failure, non-finite or silent TTS, Ollama failure, or schema
 mismatch stops startup. The runtime has no CPU, cloud, ACP, or reduced-tool fallback.
 
+### Linux prerequisites
+
+The helper is the same on both platforms; only the GPU backend and the display path differ.
+`scripts/local-openlive-preflight` checks everything below before anything expensive runs, and both
+`local-openlive-setup` and `local-openlive-check` call it.
+
+| Requirement | Why | Check |
+|---|---|---|
+| Node 22 or later, pnpm 10 or later | Exact `pnpm-lock.yaml` install and the pinned build | `node -v`, `pnpm -v` |
+| Ollama answering on `127.0.0.1:11434` | Default keyless loopback brain | `node -e 'fetch("http://127.0.0.1:11434/api/version")'` |
+| `qwen3.5:4b` pulled | Setup probes the exact model ID, not a name pattern | `ollama list` |
+| A Vulkan driver listing an ICD | Chromium reaches WebGPU only through Vulkan on Linux | `vulkaninfo --summary` |
+| X11 or Wayland display | Electron is a windowed process even with the window hidden | `echo $DISPLAY` |
+| PipeWire or PulseAudio | Only the live microphone loop; the helper owns no audio device | `pw-cli info 0` |
+
+The helper enables Chromium's Vulkan backend itself (`--enable-features=Vulkan`, in `local-openlive/src/gpu.ts`,
+before app readiness) because Swift launches it with a fixed argv. That selects a GPU backend; it is not a fallback.
+Without a real adapter startup still fails with `WebGPU adapter unavailable; local mode has no CPU fallback`, and
+`--enable-features=Vulkan` is the difference between that error and a working adapter on an NVIDIA, AMD or Intel GPU.
+Electron's `--no-sandbox` is deliberately not added: the helper needs Linux unprivileged user namespaces, which is
+the default on current distributions.
+
+Ollama in local-only mode as a user service:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/ollama.service <<'EOF'
+[Unit]
+Description=Ollama local model server (loopback only, cloud disabled)
+After=network.target
+
+[Service]
+Type=simple
+Environment=OLLAMA_NO_CLOUD=1
+Environment=OLLAMA_HOST=127.0.0.1:11434
+ExecStart=/usr/local/bin/ollama serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user enable --now ollama
+```
+
+Adjust `ExecStart` to wherever the distro or Homebrew put the binary.
+
+`MESA-LOADER: failed to open dri: …/dri_gbm.so` on stderr is harmless: it comes from Mesa's GBM loader inside the GPU
+process, while the adapter is created through Vulkan. The probes report the adapter they actually got, so a real GPU
+failure appears as `adapter: null` and a non-zero exit, never as a silent CPU path.
+
 If the Electron child crashes mid-session, herdr-voice relaunches it and reconnects to its new port, with the
 conversation recap, in about 5 s on a warm model cache. A helper that keeps failing backs off like any lost connection
 (1, 2, 4 … 30 s) and gives up after 8 tries; ⌥⌘M or choosing Local from the orb then tries again.
+
+A dropped **socket** is not a dead **host**, and the difference is worth the warm models. The helper is a long-lived
+Electron process that takes several seconds to reload its models, and its loopback port stays valid for as long as it
+lives, so the two failures are handled differently:
+
+| Failure | What happens |
+|---|---|
+| The socket dropped, the helper is alive | Redial the same port: 0.2 s, 0.5 s, then 1 s apart, up to 6 tries. Warm models are kept, nothing is said, and the orb goes back to blue when the session is up |
+| The helper process is gone | Relaunch it (SIGTERM, then SIGKILL and a wait for exit if it ignores that), reload the models, and reconnect; two relaunches in a row is the limit, then it stops with one readable line |
+
+Only a host whose process is actually gone is relaunched (`Reconnect.relaunchesHelper`); a live host whose port stopped
+answering is retried and then reported, never silently replaced. That is the fix for a reconnect loop that ran in the
+window: every late keepalive used to relaunch the whole inference host, so one slow beat became a restart cycle.
+
+The keepalive is a `heartbeat` message the helper answers every 5 s, and the socket is only called dead after **two**
+consecutive misses — one slow turn is not evidence of anything. The helper answers from its own socket handler, never
+from a turn in flight, so a GPU that is busy transcribing or synthesising cannot make the socket look dead. A
+WebSocket ping could not do this job on Linux: swift-corelibs-foundation writes the ping frame but never calls the pong
+handler, so a ping-based check reports every live socket as dead.
+
+`scripts/local-keepalive-check` proves all of it against the real helper: it holds a quiet session for the keepalive
+window, stalls the helper's heartbeats to show a socket retry with no relaunch, kills the helper to show a relaunch
+with the orb red then blue, and checks that neither case leaves an Electron process behind.
 
 This version uses Electron's persistent Cache API for speech assets. The cache, Electron's other data, and the setup
 inventory live in a state directory outside the plugin folder, so a plugin update from `herdr plugin install` keeps
@@ -159,7 +234,17 @@ slower. The runtime therefore keeps the actual upstream fp32 path and rejects no
 
 The first strict integrated smoke on Apple M4 Pro completed one real `list_agents` call and measured 9,645.5 ms from
 commit to first non-silent returned PCM. That single run proves routing, not a latency distribution. Its public summary
-is in [`local-openlive-results.json`](local-openlive-results.json). Ignored WAV and JSONL artifacts and raw tool output stay
-outside Git.
+is in [`local-openlive-results.json`](local-openlive-results.json), alongside the Linux run below. Ignored WAV and JSONL
+artifacts and raw tool output stay outside Git.
+
+On Linux (RTX 4050 Laptop, 6 GB, driver 615.71.10, Vulkan 1.4.351) the helper reports adapter `nvidia`/`lovelace` and
+the fp32 probes land in the same range as macOS: 271–334 ms for the silence STT probe, 347–498 ms for the short TTS
+phrase, from the strict-offline restart as well as setup. The model cache digest is byte-identical to the macOS run, so
+both platforms load the same weights. The integrated demo completed one real `list_agents` call in 6,754.4 ms, but that
+run is not a latency sample: it drove the 6 GB card to 5,830 MiB with 24 MiB free, and Dawn logged 200
+`VK_ERROR_OUT_OF_DEVICE_MEMORY` failures on `CreateBuffer`, so the number includes work redone after exhaustion. The
+full fp32 Whisper + Kokoro working set plus a desktop session leaves no headroom on a 6 GB laptop GPU; a run without
+exhaustion, or a card with more memory, is needed before quoting a Linux latency figure. The 500 ms target stays
+**unmet** on both platforms.
 
 Vision is unsupported in the native local voice path because Herdr has no permission contract for capturing frames.

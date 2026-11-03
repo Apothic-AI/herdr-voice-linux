@@ -1,0 +1,5 @@
+module CPortAudio [system] {
+    header "shim.h"
+    link "portaudio"
+    export *
+}

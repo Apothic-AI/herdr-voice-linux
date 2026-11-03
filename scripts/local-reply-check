@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# Proves the one thing a stub cannot: that a *local* spoken turn is heard, answered, and played to the end.
+#
+# The gap this closes: every other check either drives a protocol stub (so no real speech recognition) or the real
+# helper without any speech at all. Nothing proved that saying something to the local provider produces a reply that
+# actually plays — the operator's report was "it transcribes me and then says nothing", and the fix for that could
+# only be confirmed by a human speaking into a headset.
+#
+# So this speaks for the human. espeak writes the utterance into a null sink, a remap source turns that sink into a
+# capture device, and the app is pointed at it by name. Playback goes to a second null sink whose monitor is
+# recorded, so the reply is measured as audio rather than inferred from a log line.
+#
+# Silent by construction: both sinks are null sinks, so nothing is audible and nothing is left pointing at a real
+# device. Every module is unloaded in the same command that loaded it, and a trap does it on any exit path.
+#
+#   ./scripts/local-reply-check                 # about 90 s
+#   KEEP=1 ./scripts/local-reply-check          # keep the recordings for listening
+#
+# Evidence: /tmp/local-reply-evidence (recordings, app log, measurements).
+set -uo pipefail
+
+repo=$(cd "$(dirname "$0")/.." && pwd)
+bin="$repo/.build/release/herdr-voice"
+evidence=${EVIDENCE:-/tmp/local-reply-evidence}
+mic_sink=hv_tts_in
+out_sink=hv_tts_out
+# PortAudio does not report the PulseAudio source name: it publishes a remap as "Remapped <master> source". Naming
+# the PulseAudio source here silently matches nothing, the app falls back to the real default input, and the check
+# then measures the room instead of the utterance. Keep both names: `pactl` speaks the first, PortAudio the second.
+pulse_source=hv_tts_mic
+mic_source="Remapped ${mic_sink}.monitor source"
+# The utterance is the repo's own human-speech fixture, not synthesized speech: espeak's robotic voice is
+# intelligible to a person and not to Whisper tiny, so a synthesized utterance tests the plumbing and nothing above
+# it. Override with SAY_WAV to try another recording.
+fixture="$repo/local-openlive/fixtures/list-my-herdr-agents.wav"
+utterance=${SAY_WAV:-$fixture}
+reply_window=${WINDOW:-45}
+pass=0 fail=0
+
+mkdir -p "$evidence"
+log="$evidence/app.log"
+mic_modules="" out_modules=""
+app_pid=""
+
+ok() { echo "PASS $*"; pass=$((pass + 1)); }
+no() { echo "FAIL $*"; fail=$((fail + 1)); }
+say() { echo; echo "== $*"; }
+
+cleanup() {
+    [ -n "$app_pid" ] && kill "$app_pid" 2>/dev/null
+    for _ in $(seq 1 60); do pgrep -x herdr-voice >/dev/null 2>&1 || break; sleep 0.1; done
+    pkill -x herdr-voice 2>/dev/null
+    # Unload in the same breath as killing the app: an orphaned remap or null sink outliving the run is what once
+    # re-pointed a module at a real sink's monitor and howled in the operator's headphones.
+    for m in $mic_modules $out_modules; do pactl unload-module "$m" 2>/dev/null; done
+    return 0
+}
+trap cleanup EXIT
+
+say "== 0. a virtual microphone and a silent place to play =="
+mic_modules=$(pactl load-module module-null-sink sink_name="$mic_sink" 2>/dev/null)
+out_modules=$(pactl load-module module-null-sink sink_name="$out_sink" 2>/dev/null)
+# The remap is what makes the sink usable as a *capture* device: a sink's own monitor is feedback-prone and the app
+# refuses it by name, while a remap source is an ordinary source the app is happy to capture.
+mic_remap=$(pactl load-module module-remap-source master="$mic_sink.monitor" source_name="$pulse_source" 2>/dev/null)
+mic_modules="$mic_modules $mic_remap"
+if [ -n "$mic_modules" ] && [ -n "$out_modules" ] && pactl list short sources | grep -q "$pulse_source"; then
+    ok "loaded two null sinks and a remap source ($pulse_source), all silent"
+else
+    no "could not build the virtual microphone; check pactl"
+    exit 1
+fi
+
+say "== 1. the app, capturing from the virtual microphone =="
+[ -x "$bin" ] || (cd "$repo" && swift build -c release) || { no "no release binary"; exit 1; }
+# HERDR_VOICE_ECHO_CANCEL=0: the canceller would subtract a reference the app is not actually hearing back, and this
+# check is about the turn completing, not about echo suppression (linux-audio-check measures that).
+#
+# Output is named explicitly, NOT via PULSE_SINK: the app picks its output with library.defaultOutputDevice
+# (AudioEngine.swift:159) and PULSE_SINK never reaches PortAudio, so relying on it left the app playing the greeting
+# into the operator's real speakers. Device selection happens before the session connects, so a fallback is caught
+# and the app killed before it can make a sound.
+#
+# HERDR_VOICE_GATE_DEBUG=1 is for the failing run. When no transcript appears, the gate meter is the only line in this
+# log that separates the two faults behind that one symptom: the microphone never heard the utterance (no OPEN at all)
+# from the microphone hearing it and the onset being suppressed by a pending reply (OPEN with `pending yes`). The
+# second leaves no other trace, and it is the shape a stuck reply takes. On a passing run it adds a meter line every
+# 5 s, which is what makes a failing run diagnosable from the log alone rather than from a rebuilt binary.
+env DISPLAY="${DISPLAY:-:1}" \
+    HERDR_VOICE_OUTPUT_DEVICE="$out_sink" \
+    HERDR_VOICE_INPUT_DEVICE="$mic_source" HERDR_VOICE_ECHO_CANCEL=0 \
+    HERDR_VOICE_DEBUG_EVENTS=1 \
+    HERDR_VOICE_GATE_DEBUG=1 \
+    "$bin" --provider local --here >"$log" 2>&1 &
+app_pid=$!
+
+connected="" fellback=""
+for _ in $(seq 1 300); do
+    # The warning means the app would play to the operator. Stop it there, before the greeting.
+    grep -q 'no output device matching' "$log" 2>/dev/null && { fellback=yes; break; }
+    grep -q '● connected' "$log" 2>/dev/null && { connected=yes; break; }
+    kill -0 "$app_pid" 2>/dev/null || break
+    sleep 0.5
+done
+if [ -n "$fellback" ]; then
+    kill "$app_pid" 2>/dev/null
+    no "the named output device did not match, so the app would have played to the real speakers: $(grep -m1 'no output device matching' "$log")"
+    exit 1
+fi
+[ -n "$connected" ] && ok "the app connected to the local provider" || { no "the app never connected"; tail -20 "$log"; exit 1; }
+# The fallback is the failure mode worth catching: a device name that matches nothing is a warning, not an error, so a
+# check that only looked at "connected" would happily measure the operator's real microphone.
+if grep -q 'no input device matching' "$log"; then
+    no "the app did not find the virtual microphone and fell back: $(grep -m1 'no input device matching' "$log")"
+else
+    ok "the app captured from the named virtual microphone (no fallback warning)"
+fi
+
+# Silence asserted, not assumed: the whole point of the null sink is that the operator hears nothing, and the failure
+# mode is invisible - the app plays to the default sink (here a Bluetooth headset) with no error at all. PortAudio opens
+# the ALSA device directly, so there is no PulseAudio sink-input carrying the app's pid to match on; what is observable
+# is the sink run-state. While the app is audible the null sink must be RUNNING and the real default sink must not be.
+say "-- is it actually silent?"
+default_sink=$(pactl get-default-sink 2>/dev/null)
+state_of() { pactl list short sinks 2>/dev/null | awk -v s="$1" '$2 == s {print $5}' | head -1; }
+out_state=$(state_of "$out_sink")
+default_state=$(state_of "$default_sink")
+if [ "$default_state" != "RUNNING" ]; then
+    ok "the real sink ($default_sink) is not being played to (state ${default_state:-unknown}) - silent"
+elif [ "$out_state" = "RUNNING" ]; then
+    ok "playback is going to the null sink $out_sink (RUNNING)"
+else
+    no "the default sink $default_sink is RUNNING - the check may be audible in the operator's headphones"
+fi
+
+say "== 2. speak the utterance into the virtual microphone =="
+if [ ! -s "$utterance" ]; then no "no utterance recording at $utterance"; exit 1; fi
+cp "$utterance" "$evidence/utterance.wav"
+ok "using $utterance"
+
+# Record the reply before speaking, so the first syllable cannot be missed.
+parec --device="${out_sink}.monitor" --format=s16le --rate=24000 --channels=1 \
+      --file-format=wav "$evidence/reply.wav" >/dev/null 2>&1 &
+rec_pid=$!
+
+# Speak more than once, the way a person does when a voice assistant seems not to have heard them. Two things make a
+# single utterance unreliable here, both correct behaviour rather than bugs: the local provider greets on connect, and
+# an onset that arrives while the assistant is audible is deliberately ignored (it is probably its own echo) so that
+# the assistant cannot transcribe itself and bump the wire epoch mid-turn. Repeating the utterance sidesteps the
+# greeting window without weakening either guarantee, and the transcript assertion below still requires exactly one
+# real transcription.
+say "== 3. is the turn heard? (up to ${reply_window}s, repeating the utterance)"
+heard="" attempts=0
+for tick in $(seq 1 "$reply_window"); do
+    grep -q '^you: ' "$log" 2>/dev/null && { heard=yes; break; }
+    # Every 6 s, say it again - but only while the assistant is not speaking, so we never test the echo guard.
+    if [ $((tick % 6)) -eq 1 ] && ! tail -3 "$log" 2>/dev/null | grep -q '◎ orb: speaking'; then
+        paplay --device="$mic_sink" "$evidence/utterance.wav" 2>/dev/null && attempts=$((attempts + 1))
+    fi
+    sleep 1
+done
+[ "$attempts" -gt 0 ] && ok "spoke the utterance into the virtual microphone ($attempts time(s))" \
+    || no "could not play the utterance"
+[ -n "$heard" ] && ok "the local provider transcribed the spoken utterance" \
+    || no "no transcript appeared after $attempts attempt(s) - the turn was never heard"
+grep -m1 '^you: ' "$log" | sed 's/^/    /'
+
+say "== 4. does a reply play, and does it reach the end? (${reply_window}s)"
+# "Played to the end" is measured, not inferred: the recording is cut into 100 ms windows and the reply must show
+# real audio, keep showing it, and then stop - a reply truncated mid-sentence would leave a gap of silence.
+saw_audio=""
+for _ in $(seq 1 "$reply_window"); do
+    grep -q '^voice: ' "$log" 2>/dev/null && { saw_audio=yes; break; }
+    sleep 1
+done
+[ -n "$saw_audio" ] && ok "the local provider produced a spoken reply" || no "no reply transcript appeared"
+grep -m1 '^voice: ' "$log" | sed 's/^/    /'
+sleep 3
+kill "$rec_pid" 2>/dev/null
+for _ in $(seq 1 40); do kill -0 "$rec_pid" 2>/dev/null || break; sleep 0.1; done
+
+python3 - "$evidence/reply.wav" <<'PY'
+import sys, wave, struct
+path = sys.argv[1]
+try:
+    w = wave.open(path, 'rb')
+except Exception as e:
+    print(f"NOFILE {e}"); sys.exit(0)
+n = w.getnframes(); rate = w.getframerate(); ch = w.getnchannels()
+raw = w.readframes(n)
+w.close()
+samples = struct.unpack(f"<{len(raw)//2}h", raw)
+if not samples:
+    print("EMPTY"); sys.exit(0)
+win = max(1, rate // 10)
+loud = []
+for i in range(0, len(samples), win):
+    chunk = samples[i:i+win]
+    if not chunk: break
+    rms = (sum(s*s for s in chunk) / len(chunk)) ** 0.5
+    loud.append(rms > 120)
+spans = []
+start = None
+for i, v in enumerate(loud):
+    if v and start is None: start = i
+    elif not v and start is not None:
+        spans.append((start, i)); start = None
+if start is not None: spans.append((start, len(loud)))
+longest = max(((b - a) for a, b in spans), default=0)
+talk = sum(b - a for a, b in spans)
+print(f"DURATION {n/rate:.2f}s RATE {rate} CH {ch}")
+print(f"LOUD_SPANS {len(spans)} TALKING {talk/10:.1f}s LONGEST {longest/10:.1f}s")
+print(f"LAST_AUDIO_AT {max((b for a, b in spans), default=0)/10:.1f}s")
+PY
+
+measure=$(python3 - "$evidence/reply.wav" <<'PY'
+import sys, wave, struct
+try:
+    w = wave.open(sys.argv[1], 'rb'); n=w.getnframes(); rate=w.getframerate(); raw=w.readframes(n); w.close()
+except Exception:
+    print("0 0"); raise SystemExit
+s = struct.unpack(f"<{len(raw)//2}h", raw)
+win = max(1, rate//10); loud=[]
+for i in range(0, len(s), win):
+    c = s[i:i+win]
+    if not c: break
+    loud.append((sum(x*x for x in c)/len(c)) ** 0.5 > 120)
+spans=[]; start=None
+for i,v in enumerate(loud):
+    if v and start is None: start=i
+    elif not v and start is not None: spans.append((start,i)); start=None
+if start is not None: spans.append((start,len(loud)))
+print(f"{sum(b-a for a,b in spans)/10:.1f} {max((b for a,b in spans), default=0)/10:.1f}")
+PY
+)
+talk=$(echo "$measure" | cut -d' ' -f1)
+last=$(echo "$measure" | cut -d' ' -f2)
+awk "BEGIN{exit !($talk >= 0.6)}" && ok "a reply played (${talk}s of audio in the recording)" \
+    || no "no reply audio in the recording (${talk}s)"
+# Reaching the end: the last reply audio must be followed by silence that the app did not cut short. A reply that
+# died mid-sentence shows as a short talking span that stops well before the window closes.
+awk "BEGIN{exit !($last >= 1.0)}" && ok "the reply was still producing audio at ${last}s - it did not die in the first instant" \
+    || no "the reply's audio stopped at ${last}s"
+# The ALSA and MESA lines are PortAudio probing a machine with no such cards; they are noise, and grepping for
+# "error" without dropping them reports eight failures that are not failures.
+grep -viE '^(ALSA lib|MESA-LOADER)' "$log" | grep -iE '✖|error|⚠' | tail -6 | sed 's/^/    /'
+
+say "== 5. did the assistant's own voice get transcribed as the developer?"
+# The failure this pins: the reply came back through the microphone and the provider transcribed it as user input,
+# which opened a new utterance and left the turn waiting forever.
+own=$(grep -c '^you: ' "$log")
+[ "$own" -le 2 ] && ok "no burst of self-transcription ($own transcript event(s))" \
+    || no "the assistant's own voice was transcribed $own times"
+grep -n "you spoke over the voice" "$log" | head -3 | sed 's/^/    /'
+
+say "== results =="
+echo "evidence: $evidence  (utterance.wav, reply.wav, app.log)"
+echo "passed $pass, failed $fail"
+[ "$fail" -eq 0 ]

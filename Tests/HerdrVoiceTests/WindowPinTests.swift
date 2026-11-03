@@ -1,4 +1,3 @@
-import CoreGraphics
 import Testing
 @testable import HerdrVoiceCore
 
@@ -16,9 +15,9 @@ private let parents: [Int32: Int32] = [26119: 77426, 77426: 10987, 10987: 10986,
 }
 
 private let terminal: Int32 = 3747
-private func win(_ n: Int, _ name: String?, pid: Int32 = terminal, h: CGFloat = 800, layer: Int = 0,
+private func win(_ n: Int, _ name: String?, pid: Int32 = terminal, h: Double = 800, layer: Int = 0,
                  shown: Bool = true) -> WindowPin.Window {
-    WindowPin.Window(number: n, pid: pid, layer: layer, name: name, frame: CGRect(x: 0, y: 0, width: 1200, height: h),
+    WindowPin.Window(number: n, pid: pid, layer: layer, name: name, frame: Rect(x: 0, y: 0, width: 1200, height: h),
                      isOnScreen: shown)
 }
 private let herdrWin = win(502, "repo — herdr voice — herdr ▸ -zsh — 269×70")

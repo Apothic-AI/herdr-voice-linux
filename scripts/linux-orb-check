@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+#
+# Proves the orb window is actually painted, on a real composited X11 display.
+#
+# The bug this exists to prevent: the orb's window was created, mapped, override-redirect, `IsViewable` and the right
+# size and position — and completely blank. `XCreateImage` was asked for its pixels with a NULL data pointer, which
+# does not allocate anything: it hands back an image whose `data` is NULL, `XPutImage` cannot transfer one of those,
+# and the guard in the present path bailed out before any put was issued. Nothing failed loudly, nothing was logged,
+# and every window property still looked right.
+#
+# So "the window is viewable" cannot be the assertion, and neither can "the drawing code produces colours" — the
+# drawing was always fine. What this check measures is the pixels the *server* holds:
+#
+#   - per mood, the orb window read back with XGetImage must have many colours, a non-zero mean and non-zero alpha;
+#   - the same region captured from the *root* window must differ from how it looked before the orb existed, because
+#     a window the compositor never blends is invisible however correct its own contents are;
+#   - the palettes must actually change between moods, or a single still frame would pass;
+#   - a control window built the same way, mapped and `IsViewable`, but never drawn into, must *fail* those
+#     assertions — that is the exact shape of the bug, and an assertion it can pass proves nothing;
+#   - a deliberately invalid request must be reported by the X error handler, because a silently dropped request is
+#     how the blank window stayed unexplained.
+#
+# The probe is compiled from the app's own sources (OrbX11.swift, OrbPaint.swift, the Xlib shim) so it exercises the
+# present path that ships, not a copy of it.
+#
+# Nothing is audible (PULSE_SINK=hv_null; the probe plays no audio at all) and the windows exist only while this runs.
+#
+# Usage: scripts/linux-orb-check [--no-build]
+#   Display: $DISPLAY (override with ORB_CHECK_DISPLAY); it needs a compositor and a depth-32 visual to test the ARGB
+#   path the operator actually runs.
+#   Evidence and logs: /tmp/orb-check-evidence (override with ORB_CHECK_EVIDENCE).
+#   Exit code is the number of failed checks.
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+EVID=${ORB_CHECK_EVIDENCE:-/tmp/orb-check-evidence}
+DISPLAY_TARGET=${ORB_CHECK_DISPLAY:-${DISPLAY:-:1}}
+BUILD="$ROOT/.build/debug"
+PROBE="$EVID/probe"
+PROBE_SRC="$EVID/main.swift"
+mkdir -p "$EVID"
+LOG="$EVID/check.log"
+: >"$LOG"
+PASSED=0
+FAILED=0
+CHECKS=()
+PROBE_PID=""
+
+say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+pass() { PASSED=$((PASSED + 1)); CHECKS+=("PASS $*"); say "PASS $*"; }
+fail() { FAILED=$((FAILED + 1)); CHECKS+=("FAIL $*"); say "FAIL $*"; }
+
+cleanup() {
+    [[ -n ${PROBE_PID:-} ]] && kill "$PROBE_PID" 2>/dev/null
+    # The probe owns both windows and destroys them on exit, but a killed probe must not leave one on screen.
+    if DISPLAY=$DISPLAY_TARGET xdotool search --name 'herdr-voice orb check' >/dev/null 2>&1; then
+        DISPLAY=$DISPLAY_TARGET xdotool search --name 'herdr-voice orb check' 2>/dev/null |
+            while read -r window; do DISPLAY=$DISPLAY_TARGET xdotool windowkill "$window" 2>/dev/null; done
+    fi
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------- probe
+cat >"$PROBE_SRC" <<'SWIFT'
+import CCairo
+import CX11
+import Foundation
+import HerdrVoiceCore
+
+/// Stands in for the app's logger; the check reads these lines.
+func log(_ line: String) { print("LOG " + line); fflush(stdout) }
+
+/// Xlib constants the clang importer does not carry across: `ZPixmap` from X.h, `AllPlanes` from Xlib.h.
+let zpixmap: Int32 = 2
+let allPlanes: UInt = UInt.max
+
+/// One capture, measured — the same numbers `identify` reports for the PNG written beside it.
+struct Sample {
+    var unique = 0
+    var meanR = 0.0
+    var meanG = 0.0
+    var meanB = 0.0
+    var meanA = 0.0
+    var pixels: [UInt32] = []
+}
+
+func sample(_ display: OpaquePointer, _ drawable: XID, x: Int32, y: Int32, width: Int32, height: Int32) -> Sample? {
+    guard let image = XGetImage(display, drawable, x, y, UInt32(width), UInt32(height), allPlanes, zpixmap) else {
+        return nil
+    }
+    defer { _ = image.pointee.f.destroy_image(image) }
+    var result = Sample()
+    var seen = Set<UInt32>()
+    result.pixels.reserveCapacity(Int(width * height))
+    for row in 0..<height {
+        for column in 0..<width {
+            // `XGetPixel` is a macro over this function pointer, so it is called the way Xlib calls it.
+            let pixel = UInt32(truncatingIfNeeded: image.pointee.f.get_pixel(image, column, row))
+            result.pixels.append(pixel)
+            seen.insert(pixel)
+            result.meanA += Double((pixel >> 24) & 0xff)
+            result.meanR += Double((pixel >> 16) & 0xff)
+            result.meanG += Double((pixel >> 8) & 0xff)
+            result.meanB += Double(pixel & 0xff)
+        }
+    }
+    let count = Double(width * height)
+    result.unique = seen.count
+    result.meanR /= count
+    result.meanG /= count
+    result.meanB /= count
+    result.meanA /= count
+    return result
+}
+
+/// How many pixels differ between two captures of the same region.
+func difference(_ a: Sample, _ b: Sample) -> Int {
+    guard a.pixels.count == b.pixels.count else { return -1 }
+    return zip(a.pixels, b.pixels).reduce(0) { $0 + ($1.0 == $1.1 ? 0 : 1) }
+}
+
+func writePng(_ sample: Sample, width: Int32, height: Int32, to path: String, opaque: Bool) {
+    guard let surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height),
+          let data = cairo_image_surface_get_data(surface)
+    else { return }
+    let stride = Int(cairo_image_surface_get_stride(surface))
+    for row in 0..<Int(height) {
+        let destination = data + row * stride
+        destination.withMemoryRebound(to: UInt32.self, capacity: Int(width)) { rowPixels in
+            for column in 0..<Int(width) {
+                var pixel = sample.pixels[row * Int(width) + column]
+                // A root capture is depth 24: no alpha byte, so the PNG says "opaque" rather than "invisible".
+                if opaque { pixel |= 0xFF00_0000 }
+                rowPixels[column] = pixel
+            }
+        }
+    }
+    cairo_surface_mark_dirty(surface)
+    _ = cairo_surface_write_to_png(surface, path)
+    cairo_surface_destroy(surface)
+}
+
+func stateName(_ mood: Mood) -> String {
+    switch mood {
+    case .muted: "muted"
+    case .listening: "listening"
+    case .speaking: "speaking"
+    case .working: "working"
+    case .offline: "offline"
+    }
+}
+
+func report(_ sample: Sample) -> String {
+    String(format: "unique=%d meanR=%.1f meanG=%.1f meanB=%.1f meanA=%.1f",
+           sample.unique, sample.meanR, sample.meanG, sample.meanB, sample.meanA)
+}
+
+let evidence = ProcessInfo.processInfo.environment["ORB_EVIDENCE"] ?? "/tmp/orb-check-evidence"
+try? FileManager.default.createDirectory(atPath: evidence, withIntermediateDirectories: true)
+
+guard let x = OrbX11() else {
+    log("no X display is reachable")
+    exit(2)
+}
+let alpha = x.hasAlpha && x.hasCompositor
+log("display: depth-32 visual=\(x.hasAlpha) compositor=\(x.hasCompositor) -> alpha window=\(alpha)")
+
+let size = Int32(OrbPaint.size)
+// The corner placement the app uses when there is no host window: 20 px inside the work area's bottom-left.
+let area = x.workArea(refreshedAt: 1_000_000_000)
+let originX = Int32((area.minX + 20).rounded())
+let originY = Int32((area.maxY - Double(size) - 20).rounded())
+log("window origin +\(originX)+\(originY), size \(size)x\(size)")
+
+// What the same region looks like before the orb exists: the "terminal behind it" the root capture is compared to.
+let baseline = sample(x.display, x.root, x: originX, y: originY, width: size, height: size)
+if let baseline {
+    writePng(baseline, width: size, height: size, to: "\(evidence)/root-before.png", opaque: true)
+    print("ROOTBEFORE \(report(baseline))")
+} else {
+    print("ROOTBEFORE <no capture>")
+}
+
+guard let window = OrbX11Window(x: x, name: "herdr-voice orb check", width: size, height: size,
+                                events: X11.exposureMask, alpha: alpha)
+else {
+    log("could not create the orb window")
+    exit(3)
+}
+window.move(toX: originX, y: originY)
+window.map()
+usleep(300_000) // the compositor's frame, and the server's map
+
+var animation = OrbAnimation()
+for mood in [Mood.muted, .listening, .speaking, .working, .offline] {
+    // Let the palette cross-fade finish (the app fades over ~0.6 s) so each mood is captured settled.
+    let mic: Float = mood == .listening ? 0.75 : 0.08
+    let voice: Float = mood == .speaking ? 0.85 : 0
+    for _ in 0..<90 {
+        animation.step(dt: 1.0 / 60.0, mood: mood, mic: mic, voice: voice, thinking: mood == .working)
+    }
+    guard let surface = window.render({ context, width, _ in
+        OrbPaint.draw(context, size: width, look: animation.look, opaqueBackdrop: !window.hasAlpha)
+    }) else {
+        print("ORB mood=\(stateName(mood)) render=nil")
+        continue
+    }
+    cairo_surface_flush(surface)
+    _ = cairo_surface_write_to_png(surface, "\(evidence)/orb-\(stateName(mood)).png")
+    usleep(200_000) // presented, composited, then read back from the server
+
+    guard let presented = sample(x.display, window.id, x: 0, y: 0, width: size, height: size),
+          let root = sample(x.display, x.root, x: originX, y: originY, width: size, height: size)
+    else {
+        print("ORB mood=\(stateName(mood)) capture=failed")
+        continue
+    }
+    writePng(presented, width: size, height: size, to: "\(evidence)/presented-\(stateName(mood)).png", opaque: false)
+    writePng(root, width: size, height: size, to: "\(evidence)/root-\(stateName(mood)).png", opaque: true)
+    let changed = baseline.map { difference($0, root) } ?? -1
+    print("ORB mood=\(stateName(mood)) \(report(presented)) rootdiff=\(changed) rootunique=\(root.unique)")
+}
+
+// The negative control: a window built exactly like the orb's, mapped and IsViewable, and never drawn into — the
+// shape the bug had. It must fail the same assertion the orb has to pass, or the assertion proves nothing.
+if let control = OrbX11Window(x: x, name: "herdr-voice orb check control", width: size, height: size,
+                              events: X11.exposureMask, alpha: alpha) {
+    control.move(toX: originX + size + 8, y: originY)
+    control.map()
+    usleep(300_000)
+    if let blank = sample(x.display, control.id, x: 0, y: 0, width: size, height: size) {
+        writePng(blank, width: size, height: size, to: "\(evidence)/control-never-drawn.png", opaque: false)
+        print("CONTROL viewable=\(control.isViewable) \(report(blank))")
+    } else {
+        print("CONTROL viewable=\(control.isViewable) capture=failed")
+    }
+    control.unmap()
+}
+
+// A deliberate error on the connection, so the handler is proven to report one: without it the same failure is
+// invisible, which is how a rejected present became a blank window with nothing in the log.
+XDestroyWindow(x.display, 1)
+XSync(x.display, 0)
+let counts = X11Errors.counts
+print("XERR deliberate=\(counts.keys.sorted().joined(separator: ","))")
+
+window.unmap()
+print("DONE")
+SWIFT
+
+# ---------------------------------------------------------------- build
+if [[ ${1:-} != "--no-build" ]]; then
+    say ""
+    say "-- build: the app and its core module"
+    if swift build --package-path "$ROOT" >"$EVID/build.log" 2>&1; then
+        pass "the app builds (debug), so the probe compiles against what ships"
+    else
+        fail "the app failed to build (see $EVID/build.log)"
+        tail -20 "$EVID/build.log" | tee -a "$LOG"
+        exit "$FAILED"
+    fi
+fi
+if [[ ! -f "$BUILD/Modules/HerdrVoiceCore.swiftmodule" ]]; then
+    fail "no HerdrVoiceCore module in $BUILD/Modules: run without --no-build"
+    exit "$FAILED"
+fi
+
+say ""
+say "-- probe: OrbX11.swift, OrbPaint.swift and the Xlib shim, compiled from the app's own sources"
+CAIRO_CFLAGS=$(pkg-config --cflags cairo 2>/dev/null || true)
+# shellcheck disable=SC2086
+if swiftc -O \
+    -Xcc -fmodule-map-file="$ROOT/Sources/CCairo/module.modulemap" \
+    -Xcc -fmodule-map-file="$ROOT/Sources/CX11/module.modulemap" \
+    $CAIRO_CFLAGS -I "$BUILD/Modules" \
+    -o "$PROBE" \
+    "$ROOT/Sources/herdr-voice/Linux/OrbX11.swift" \
+    "$ROOT/Sources/herdr-voice/Linux/OrbPaint.swift" \
+    "$ROOT/Sources/herdr-voice/Linux/X11Lib.swift" \
+    "$BUILD"/HerdrVoiceCore.build/*.o \
+    "$PROBE_SRC" >"$EVID/probe-build.log" 2>&1; then
+    pass "the probe compiles from the orb's own window and paint sources"
+else
+    fail "the probe failed to compile (see $EVID/probe-build.log)"
+    grep -E "error" "$EVID/probe-build.log" | head -10 | tee -a "$LOG"
+    exit "$FAILED"
+fi
+
+# ---------------------------------------------------------------- run
+say ""
+say "-- present: five moods through the real present path, on $DISPLAY_TARGET"
+if ! DISPLAY=$DISPLAY_TARGET PULSE_SINK=hv_null ORB_EVIDENCE="$EVID" "$PROBE" >"$EVID/probe.log" 2>&1; then
+    fail "the probe exited non-zero (see $EVID/probe.log)"
+fi
+PROBE_PID=""
+sed 's/^/   /' "$EVID/probe.log" >>"$LOG"
+
+
+if grep -q "compositor=true" "$EVID/probe.log" && grep -q "alpha window=true" "$EVID/probe.log"; then
+    pass "the display offers a compositor and a depth-32 ARGB visual: this is the operator's path under test"
+else
+    fail "no compositor or no depth-32 visual on $DISPLAY_TARGET: the ARGB path was not exercised"
+fi
+
+# python reads the probe's key=value lines; a mood's numbers are all on one line.
+read_mood() { # <mood> <key>
+    python3 - "$EVID/probe.log" "$1" "$2" <<'PY'
+import re, sys
+log, mood, key = sys.argv[1], sys.argv[2], sys.argv[3]
+for line in open(log, errors="replace"):
+    if not line.startswith("ORB "):
+        continue
+    fields = dict(re.findall(r"([A-Za-z]+)=([^ ]+)", line))
+    if fields.get("mood") == mood:
+        print(fields.get(key, ""))
+        break
+PY
+}
+
+control_value() { # <key>
+    python3 - "$EVID/probe.log" "$1" <<'PY'
+import re, sys
+log, key = sys.argv[1], sys.argv[2]
+for line in open(log, errors="replace"):
+    if line.startswith("CONTROL "):
+        fields = dict(re.findall(r"([A-Za-z]+)=([^ ]+)", line))
+        print(fields.get(key, ""))
+        break
+PY
+}
+
+# The assertion itself, shared by the orb and the control, so "a blank window must fail" is measured, not assumed.
+# A presenting orb window has many colours, light in it, and a non-zero alpha channel.
+looks_painted() { # <unique> <meanR> <meanG> <meanB> <meanA>
+    python3 - "$@" <<'PY'
+import sys
+unique, r, g, b, a = (float(value) for value in sys.argv[1:6])
+luma = r + g + b
+sys.exit(0 if unique > 20 and luma > 5.0 and a > 1.0 else 1)
+PY
+}
+
+say ""
+say "-- window pixels: what the server holds for the orb's window, not what the paint code returned"
+mood_failures=0
+for mood in muted listening speaking working offline; do
+    line=$(grep -E "^ORB mood=$mood " "$EVID/probe.log")
+    if [[ -z $line ]]; then
+        fail "$mood: the probe produced no measurement"
+        mood_failures=$((mood_failures + 1))
+        continue
+    fi
+    unique=$(read_mood "$mood" unique)
+    mean_r=$(read_mood "$mood" meanR)
+    mean_g=$(read_mood "$mood" meanG)
+    mean_b=$(read_mood "$mood" meanB)
+    mean_a=$(read_mood "$mood" meanA)
+    root_diff=$(read_mood "$mood" rootdiff)
+    root_unique=$(read_mood "$mood" rootunique)
+    say "   $mood: unique=$unique mean=($mean_r,$mean_g,$mean_b) alpha=$mean_a root-diff=$root_diff root-unique=$root_unique"
+
+    if looks_painted "$unique" "$mean_r" "$mean_g" "$mean_b" "$mean_a"; then
+        pass "$mood: the window holds $unique colours, mean ($mean_r,$mean_g,$mean_b), alpha $mean_a"
+    else
+        fail "$mood: the window is blank (unique=$unique mean=($mean_r,$mean_g,$mean_b) alpha=$mean_a) — a blank but IsViewable window printed no error and looked exactly like this"
+        mood_failures=$((mood_failures + 1))
+    fi
+done
+
+say ""
+say "-- root pixels: the same region captured from the root window, which is what the operator sees"
+for mood in muted listening speaking working offline; do
+    root_diff=$(read_mood "$mood" rootdiff)
+    root_unique=$(read_mood "$mood" rootunique)
+    # 15% of the 96x96 region: a real orb covers a large part of it; a window the compositor never blends changes
+    # nothing at all, which is what the root capture measured while the orb was invisible.
+    if python3 -c "import sys; sys.exit(0 if $root_diff >= 1382 and $root_unique > 20 else 1)" 2>/dev/null; then
+        pass "$mood: the root capture differs from the terminal behind it in $root_diff of 9216 pixels"
+    else
+        fail "$mood: the root capture barely changed ($root_diff of 9216 pixels, $root_unique colours): the window is not on screen"
+    fi
+done
+
+say ""
+say "-- palette: the moods must not be one still frame repeated"
+previous=""
+distinct=0
+for mood in muted listening speaking working offline; do
+    mean_r=$(read_mood "$mood" meanR)
+    mean_g=$(read_mood "$mood" meanG)
+    mean_b=$(read_mood "$mood" meanB)
+    current="$mean_r,$mean_g,$mean_b"
+    if [[ -n $previous ]]; then
+        if python3 -c "import sys; p=[float(v) for v in sys.argv[1].split(',')]; c=[float(v) for v in sys.argv[2].split(',')]; sys.exit(0 if max(abs(a-b) for a,b in zip(p,c)) >= 5 else 1)" "$previous" "$current"; then
+            distinct=$((distinct + 1))
+        fi
+    fi
+    previous=$current
+done
+if (( distinct >= 3 )); then
+    pass "$distinct of the 4 mood transitions change the palette ($distinct >= 3)"
+else
+    fail "only $distinct of the 4 mood transitions change the palette: the orb may be painting one still frame"
+fi
+
+# Independent confirmation with ImageMagick, on the PNGs the probe wrote from the reads it made: the frames really
+# differ from each other, not just in their mean colour.
+if command -v compare >/dev/null 2>&1 && [[ -f "$EVID/presented-muted.png" ]] && [[ -f "$EVID/presented-speaking.png" ]]; then
+    differing=$(compare -metric AE "$EVID/presented-muted.png" "$EVID/presented-speaking.png" null: 2>&1 | grep -oE "^[0-9]+" || true)
+    if [[ -n ${differing:-} ]] && (( differing > 500 )); then
+        pass "ImageMagick counts $differing pixels differing between the muted and speaking frames"
+    else
+        fail "the muted and speaking frames are nearly identical (${differing:-?} pixels differ)"
+    fi
+fi
+
+say ""
+say "-- the negative control: a mapped, IsViewable window that was never drawn into must not pass"
+control_unique=$(control_value unique)
+control_r=$(control_value meanR)
+control_a=$(control_value meanA)
+control_viewable=$(control_value viewable)
+say "   control: viewable=$control_viewable unique=$control_unique meanR=$control_r alpha=$control_a"
+if [[ $control_viewable == "true" ]]; then
+    pass "the control window is IsViewable, exactly like the broken orb was"
+else
+    fail "the control window never became viewable, so the negative control proves nothing"
+fi
+if looks_painted "${control_unique:-0}" "${control_r:-0}" 0 0 "${control_a:-0}"; then
+    fail "the blank control window passed the pixel assertion: the assertion is too weak to catch a blank orb"
+else
+    pass "the same assertion rejects the blank control (unique=$control_unique): a viewable window cannot pass"
+fi
+
+say ""
+say "-- errors: a dropped request must be reported, not silently lost"
+xerr=$(grep -E "^XERR " "$EVID/probe.log" | head -1)
+if [[ $xerr == *"3/4/0"* ]]; then
+    pass "the X error handler reported the deliberately invalid request (BadWindow, request 4)"
+else
+    fail "the X error handler did not report a deliberately invalid request ($xerr)"
+fi
+unexpected=$(grep -c "X11 error" "$EVID/probe.log")
+if (( unexpected == 1 )); then
+    pass "that deliberate failure was the only X error in the whole run: the present path issues none"
+else
+    fail "$unexpected X errors were reported, and only the deliberate one was expected"
+    grep "X11 error" "$EVID/probe.log" | tee -a "$LOG"
+fi
+
+say ""
+say "-- cleanup: nothing of ours is left on the display"
+leftover=$(DISPLAY=$DISPLAY_TARGET xdotool search --name 'herdr-voice orb check' 2>/dev/null | wc -l)
+if (( leftover == 0 )); then
+    pass "both probe windows are gone: nothing was left on the screen"
+else
+    fail "$leftover probe window(s) are still on $DISPLAY_TARGET"
+fi
+
+say ""
+say "== $PASSED passed, $FAILED failed =="
+for check in "${CHECKS[@]}"; do say "   $check"; done
+say "logs and captures: $EVID"
+exit "$FAILED"

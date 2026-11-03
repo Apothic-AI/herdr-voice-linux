@@ -1,38 +1,23 @@
-import { randomBytes } from "node:crypto";
-import { spawn } from "node:child_process";
-import { inventoryFile, stateDir } from "./state-dir.mjs";
 import { chmod, writeFile } from "node:fs/promises";
+import { launchHelper } from "./launch.mjs";
+import { inventoryFile } from "./state-dir.mjs";
 
-const child = spawn("node_modules/.bin/electron", ["dist/main.mjs"], { stdio: ["pipe", "pipe", "inherit"] });
-child.stdin.write(`${JSON.stringify({ token: randomBytes(32).toString("base64url"), stateDir, setup: true })}\n`);
-let output = "";
+// One real WebGPU pass over the fp32 speech models: downloads the assets when absent, runs the strict STT and TTS
+// probes, and probes the exact brain model. The inventory it writes is the reference `check-runtime.mjs` verifies.
+const helper = await launchHelper({ setup: true });
+const ready = helper.record;
+let status = 1;
 try {
-  for await (const chunk of child.stdout) {
-    output += chunk.toString();
-    let newline = output.indexOf("\n");
-    if (newline < 0) continue;
-    let ready;
-    while (newline >= 0) {
-      const line = output.slice(0, newline);
-      output = output.slice(newline + 1);
-      try { ready = JSON.parse(line); } catch { /* Electron's first-run downloader may write a status line. */ }
-      if (ready?.type === "ready") break;
-      newline = output.indexOf("\n");
-    }
-    if (!ready) continue;
-    if (ready.type !== "ready" || !ready.setup) throw new Error("invalid setup readiness record");
-    await writeFile(inventoryFile, `${JSON.stringify(ready.probe.inventory, null, 2)}\n`, { mode: 0o600 });
-    await chmod(inventoryFile, 0o600);
-    process.stdout.write(`${JSON.stringify({
-      status: "ready", stateDir, webgpu: ready.probe.webgpu, adapter: ready.probe.adapter,
-      brain: ready.brain, brainProbe: ready.brainProbe,
-      inventory: { count: ready.probe.inventory.count, bytes: ready.probe.inventory.bytes, digest: ready.probe.inventory.digest },
-      sttProbeMs: ready.probe.sttProbeMs, ttsProbeMs: ready.probe.ttsProbeMs,
-    })}\n`);
-    break;
-  }
+  if (!ready.setup) throw new Error("invalid setup readiness record");
+  await writeFile(inventoryFile, `${JSON.stringify(ready.probe.inventory, null, 2)}\n`, { mode: 0o600 });
+  await chmod(inventoryFile, 0o600);
+  process.stdout.write(`${JSON.stringify({
+    status: "ready", stateDir: ready.stateDir, webgpu: ready.probe.webgpu, adapter: ready.probe.adapter,
+    brain: ready.brain, brainProbe: ready.brainProbe,
+    inventory: { count: ready.probe.inventory.count, bytes: ready.probe.inventory.bytes, digest: ready.probe.inventory.digest },
+    sttProbeMs: ready.probe.sttProbeMs, ttsProbeMs: ready.probe.ttsProbeMs,
+  })}\n`);
 } finally {
-  child.stdin.end();
+  status = await helper.finish();
 }
-const status = await new Promise((resolve) => child.once("exit", resolve));
-if (status !== 0) process.exit(Number(status ?? 1));
+if (status !== 0) process.exit(Number(status));

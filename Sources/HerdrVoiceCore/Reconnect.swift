@@ -13,19 +13,42 @@ public enum Reconnect {
     /// Consecutive failed attempts before giving up and waiting for ⌥⌘M (e.g. a revoked key fails every time).
     public static let maxAttempts = 8
 
-    /// Seconds to wait before reconnecting, or nil to wait for the developer instead.
+    /// Seconds to wait before reconnecting, or nil to stop and say so.
     /// - While muted nothing is listening, so no session is opened until unmute (providers bill by the minute).
-    /// - A session the provider ended on purpose is renewed at once; drops back off 1, 2, 4 … 30 s.
-    public static func delay(reason: Reason, attempt: Int, muted: Bool) -> TimeInterval? {
-        guard !muted, attempt < maxAttempts else { return nil }
+    /// - A session the provider ended on purpose is renewed at once; cloud drops back off 1, 2, 4 … 30 s.
+    /// - A local helper keeps its warm models, so its socket retries are fast and tiered instead of exponential.
+    public static func delay(provider: Provider, reason: Reason, attempt: Int, muted: Bool) -> TimeInterval? {
+        guard !muted else { return nil }
+        if provider == .local {
+            guard attempt < localSocketAttempts else { return nil }
+            return localSocketDelays[min(attempt, localSocketDelays.count - 1)]
+        }
+        guard attempt < maxAttempts else { return nil }
         if reason == .sessionEnded && attempt == 0 { return 0 }
         return min(30, pow(2, Double(attempt)))
     }
 
-    /// Local mode dials one Electron helper's loopback port. Once that connection is lost the helper (or its socket)
-    /// is gone, so the next attempt relaunches the helper for a fresh port instead of redialing the dead one.
-    public static func relaunchesHelper(provider: Provider, connectionLost: Bool) -> Bool {
-        provider == .local && connectionLost
+    /// Socket retries against a live local helper before the app stops and says so. A retry is cheap because the models
+    /// stay warm; a port that never comes back belongs to a host that cannot serve, and looping on it forever is worse
+    /// than saying so once and leaving the pane usable.
+    public static let localSocketAttempts = 6
+
+    /// Socket retries, fastest first: a reconnect inside a second is not worth mentioning, so the session is back
+    /// before anyone notices it went anywhere.
+    public static let localSocketDelays: [TimeInterval] = [0.2, 0.5, 1]
+
+    /// Relaunches in a row before the app stops trying. Each one reloads the models, so a host that dies again right
+    /// away is reported once instead of respawned in a loop.
+    public static let maxRelaunches = 2
+
+    /// Whether the next connect must relaunch the Local OpenLive inference host instead of redialing its port.
+    ///
+    /// A lost socket is not a dead host: the helper is a long-lived Electron process that takes ~9 s to warm up, and
+    /// its loopback port stays valid for as long as it lives, so a drop — a late keepalive included — is redialed on
+    /// the same port, models and all. Only a host whose process is actually gone is relaunched; a live host that stops
+    /// answering is retried and then reported (see `localSocketAttempts`), never silently replaced.
+    public static func relaunchesHelper(provider: Provider, connectionLost: Bool, helperAlive: Bool) -> Bool {
+        provider == .local && connectionLost && !helperAlive
     }
 
     /// Whether a server error message announces a routine session end (idle timeout or maximum duration)

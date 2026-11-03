@@ -1,0 +1,601 @@
+#!/usr/bin/env bash
+#
+# Proves the Linux window tracker and the global hotkeys against a real X server.
+#
+# The tracker and the grabs live inside the app, which needs an API key, an audio device and a provider connection
+# to run, so this compiles a probe out of *the same source files* (the tracker, the hotkeys, the Xlib shim and the
+# portable decision logic) and drives that. Everything it reports is measured, not claimed: the rectangle the
+# tracker publishes against what X reports for the same window, the latency between an external move and the
+# tracker noticing it, and the gesture that has to reach a handler.
+#
+# It is split so that it never puts anything on the operator's screen:
+#   - discovery runs against the real session display, read-only, on the terminal that is actually hosting herdr;
+#   - moves, minimize-like hiding and hotkey grabs run on a throwaway Xvfb display of their own, where a single
+#     helper window is created and destroyed inside this script.
+#
+# Usage: scripts/linux-x11-check [--no-build]
+#   Evidence and logs: /tmp/x11-evidence (override with X11_EVIDENCE_DIR).
+#   Exit code is the number of failed checks.
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+EVID=${X11_EVIDENCE_DIR:-/tmp/x11-evidence}
+# The operator's display: read only, never written to.
+REAL_DISPLAY=${DISPLAY:-:1}
+# The throwaway display the interactive checks use. Nothing here is ever visible to anyone.
+SIDE_DISPLAY=${X11_SIDE_DISPLAY:-:99}
+mkdir -p "$EVID"
+LOG="$EVID/check.log"
+: >"$LOG"
+PASSED=0
+FAILED=0
+CHECKS=()
+
+say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+pass() { PASSED=$((PASSED + 1)); CHECKS+=("PASS $*"); say "PASS $*"; }
+fail() { FAILED=$((FAILED + 1)); CHECKS+=("FAIL $*"); say "FAIL $*"; }
+
+cleanup() {
+    [[ -n ${PROBE_PID_A:-} ]] && kill "$PROBE_PID_A" 2>/dev/null
+    [[ -n ${PROBE_PID_B:-} ]] && kill "$PROBE_PID_B" 2>/dev/null
+    # The helper window and its display exist only inside this script; neither is ever left running.
+    [[ -n ${HELPER:-} ]] && DISPLAY=$SIDE_DISPLAY xdotool windowkill "$HELPER" 2>/dev/null
+    [[ -n ${HELPER_PID:-} ]] && kill "$HELPER_PID" 2>/dev/null
+    if [[ ${STARTED_XVFB:-0} == 1 ]]; then
+        pkill -f "Xvfb $SIDE_DISPLAY " 2>/dev/null
+    fi
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------- helpers
+# `jq` is not a dependency here: the probe emits one JSON object per line and this reads a field out of the last.
+last_event() { grep -o 'EVENT {.*}' "$1" 2>/dev/null | tail -1 | sed 's/^EVENT //'; }
+field() { python3 -c 'import json,sys
+try: d = json.loads(sys.argv[1])
+except Exception: print(""); raise SystemExit
+cur = d
+for key in sys.argv[2].split("."):
+    if cur is None: print(""); raise SystemExit
+    cur = cur.get(key) if isinstance(cur, dict) else None
+print("" if cur is None else cur)' "$1" "$2"; }
+
+# Numeric equality, because the probe prints JSON numbers as floats ("32.0") and X prints integers ("32").
+eq_num() { python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) == float(sys.argv[2]) else 1)" "$1" "$2"; }
+
+# Waits for a log line matching a regex, up to a deadline in milliseconds.
+wait_log() { # file regex timeout_ms
+    local file=$1 pattern=$2 timeout_ms=${3:-3000} waited=0
+    while (( waited < timeout_ms )); do
+        if grep -qE -- "$pattern" "$file" 2>/dev/null; then return 0; fi
+        sleep 0.02
+        waited=$((waited + 20))
+    done
+    return 1
+}
+
+# Waits for the *last* EVENT in a log to satisfy a predicate, so a stale earlier event can never satisfy a check
+# for a new state.
+wait_event() { # file python-expression timeout_ms
+    local file=$1 expr=$2 timeout_ms=${3:-3000} waited=0
+    while (( waited < timeout_ms )); do
+        if python3 - "$file" "$expr" <<'PY'
+import json, sys
+path, expr = sys.argv[1], sys.argv[2]
+last = None
+for line in open(path):
+    if line.startswith("EVENT "):
+        try:
+            last = json.loads(line[6:])
+        except Exception:
+            pass
+if last is None:
+    sys.exit(1)
+d = last
+sys.exit(0 if eval(expr, {"__builtins__": {}}, {"d": d, "r": d.get("rect")}) else 1)
+PY
+        then return 0; fi
+        sleep 0.02
+        waited=$((waited + 20))
+    done
+    return 1
+}
+
+# Waits for the published rect to stop being the one it was, and prints "<timestamp> <x> <y>". The published
+# rectangle is the window's client origin and can sit a pixel inside the corner a move was given, so callers
+# compare with a tolerance rather than for an exact number.
+wait_rect_change() { # file old_x old_y since_ms timeout_ms
+    local file=$1 old_x=$2 old_y=$3 since=${4:-0} timeout_ms=${5:-3000} waited=0
+    while (( waited < timeout_ms )); do
+        local found
+        found=$(python3 - "$file" "$old_x" "$old_y" "$since" <<'PY'
+import json, sys
+path, old_x, old_y, since = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4])
+for line in open(path):
+    if not line.startswith("EVENT "):
+        continue
+    try:
+        d = json.loads(line[6:])
+    except Exception:
+        continue
+    if d["t"] < since:          # only what happened after the move was asked for
+        continue
+    r = d.get("rect")
+    if not r or (r["x"] == old_x and r["y"] == old_y):
+        continue
+    print(int(d["t"]), r["x"], r["y"])
+    break
+PY
+)
+        if [[ -n $found ]]; then printf '%s
+' "$found"; return 0; fi
+        sleep 0.02
+        waited=$((waited + 20))
+    done
+    return 1
+}
+
+say "== herdr-voice Linux X11 check — $(date -Is) =="
+say "session display $REAL_DISPLAY (read only), interaction display $SIDE_DISPLAY (throwaway)"
+say "evidence in $EVID"
+
+# ---------------------------------------------------------------- probe
+PROBE="$EVID/probe"
+PROBE_SRC="$EVID/main.swift"
+cat >"$PROBE_SRC" <<'SWIFT'
+import Foundation
+import HerdrVoiceCore
+
+/// Stands in for the app's logger; the probe prints everything so a check can read it.
+func log(_ line: String) { print("LOG " + line); fflush(stdout) }
+
+func nowMs() -> Int { Int((Date().timeIntervalSince1970 * 1000).rounded()) }
+func quote(_ text: String?) -> String {
+    guard let text else { return "null" }
+    let escaped = text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+    return "\"\(escaped)\""
+}
+func rectJSON(_ rect: Rect?) -> String {
+    guard let rect else { return "null" }
+    return "{\"x\":\(rect.x),\"y\":\(rect.y),\"w\":\(rect.width),\"h\":\(rect.height)}"
+}
+func emit(hasHost: Bool, frame: Rect?) {
+    print("EVENT {\"t\":\(nowMs()),\"hasHost\":\(hasHost),\"rect\":\(rectJSON(frame))}")
+    fflush(stdout)
+}
+
+let arguments = CommandLine.arguments
+let mode = arguments.count > 1 ? arguments[1] : "track"
+
+/// Drains the main queue and the run loop for `seconds`. Tracker callbacks land on the main queue, so the probe
+/// has to keep it turning the way the app does.
+func pump(seconds: Double, each: (() -> Void)? = nil) {
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline {
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        each?()
+    }
+}
+
+switch mode {
+case "label":
+    print("LABEL \(Hotkey.label)")
+    exit(0)
+
+case "hosts":
+    // The process-ancestry answer on its own: which terminal processes own this session's windows. No window
+    // titles take part, which is the point — a terminal's title follows its active tab.
+    let pids = X11Hosts.hostPIDs().sorted()
+    print("HOSTS " + pids.map(String.init).joined(separator: ","))
+    for pid in pids {
+        let cmd = (try? String(contentsOfFile: "/proc/\(pid)/cmdline", encoding: .utf8))?
+            .split(separator: "\0").first.map(String.init) ?? "?"
+        print("HOSTPID \(pid) \(cmd)")
+    }
+    exit(0)
+
+case "rect":
+    // The frame rectangle the tracker would publish for one window id, so the arithmetic can be compared against
+    // `xwininfo`/`xprop` without the tracker's feedback loop in the way.
+    guard arguments.count > 2, let id = XWindowID(arguments[2]), let api = X11API.shared,
+          let display = api.open(nil), let names = X11Names(api, display: display),
+          let rect = api.x11FrameRect(display, id, names: names)
+    else { print("RECT null"); exit(2) }
+    print("RECT {\"window\":\(id),\"rect\":\(rectJSON(rect)),\"name\":\(quote(api.x11Title(display, id, names: names)))}")
+    exit(0)
+
+case "hotkeys":
+    let controlPath = arguments.count > 2 ? arguments[2] : ""
+    var lastControl = ""
+    Hotkey.registerMute {
+        print("HOTKEY mute"); fflush(stdout)
+    }
+    let stop: () -> Void = { print("HOTKEY esc"); fflush(stdout) }
+    Hotkey.setStopKey(active: false, stop)
+    pump(seconds: arguments.count > 3 ? Double(arguments[3]) ?? 8 : 8) {
+        guard !controlPath.isEmpty, let raw = try? String(contentsOfFile: controlPath, encoding: .utf8) else { return }
+        let wanted = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard wanted != lastControl, wanted == "active" || wanted == "inactive" else { return }
+        lastControl = wanted
+        Hotkey.setStopKey(active: wanted == "active", stop)
+    }
+
+default: // track
+    let tracker = WindowTracker()
+    tracker.start { hasHost, frame in emit(hasHost: hasHost, frame: frame) }
+    pump(seconds: arguments.count > 2 ? Double(arguments[2]) ?? 4 : 4)
+}
+
+print("FINAL probe exiting")
+SWIFT
+
+if [[ ${1:-} != --no-build ]]; then
+    say "-- swift build"
+    if swift build --package-path "$ROOT" >"$EVID/build.log" 2>&1; then
+        pass "swift build exits 0"
+    else
+        fail "swift build exits non-zero (see $EVID/build.log)"
+    fi
+fi
+
+say "-- compiling the probe from the real sources"
+BUILD="$ROOT/.build/debug"
+if [[ ! -f "$BUILD/Modules/HerdrVoiceCore.swiftmodule" ]]; then
+    swift build --package-path "$ROOT" >"$EVID/build.log" 2>&1
+fi
+if swiftc -I "$BUILD/Modules" -o "$PROBE" \
+    "$ROOT/Sources/herdr-voice/Linux/X11Lib.swift" \
+    "$ROOT/Sources/herdr-voice/Linux/X11Loop.swift" \
+    "$ROOT/Sources/herdr-voice/Linux/X11Hosts.swift" \
+    "$ROOT/Sources/herdr-voice/Linux/WindowTracker.swift" \
+    "$ROOT/Sources/herdr-voice/Linux/Hotkey.swift" \
+    "$BUILD/HerdrVoiceCore.build/Geometry.swift.o" \
+    "$BUILD/HerdrVoiceCore.build/WindowPin.swift.o" \
+    "$PROBE_SRC" >"$EVID/probe-build.log" 2>&1; then
+    pass "probe compiles from the WindowTracker/Hotkey/X11 sources"
+else
+    fail "probe failed to compile (see $EVID/probe-build.log)"
+    tail -20 "$EVID/probe-build.log" | tee -a "$LOG"
+    exit 1
+fi
+
+# ---------------------------------------------------------------- the binding label
+say "-- the label names the binding that is actually registered"
+default_label=$( DISPLAY=$REAL_DISPLAY "$PROBE" label | head -1 )
+env_label=$( HERDR_VOICE_HOTKEY_MODS=ctrl+shift HERDR_VOICE_HOTKEY_KEY=n "$PROBE" label | head -1 )
+if [[ $default_label == "LABEL Ctrl+Alt+M" ]]; then
+    pass "default binding label is Ctrl+Alt+M"
+else
+    fail "default binding label is '$default_label', expected 'LABEL Ctrl+Alt+M'"
+fi
+if [[ $env_label == "LABEL Ctrl+Shift+N" ]]; then
+    pass "label follows HERDR_VOICE_HOTKEY_MODS/HERDR_VOICE_HOTKEY_KEY"
+else
+    fail "label with ctrl+shift/n is '$env_label', expected 'LABEL Ctrl+Shift+N'"
+fi
+
+# ================================================================ 1. discovery, read-only, on the real session
+say ""
+say "-- discovery: which window hosts this terminal, and where is it (read-only queries on $REAL_DISPLAY)"
+export DISPLAY=$REAL_DISPLAY
+HERDR_VOICE_DEBUG_WINDOW=1 "$PROBE" track 3 >"$EVID/track-detect.log" 2>&1
+detect=$(last_event "$EVID/track-detect.log")
+host_line=$(grep -m1 -o 'host window 0x[0-9a-f]* "[^"]*" frame [-0-9]*,[-0-9]* [0-9]*x[0-9]*' "$EVID/track-detect.log")
+host_id=$(sed -n 's/.*host window \(0x[0-9a-f]*\).*/\1/p' <<<"$host_line")
+host_name=$(sed -n 's/.*host window 0x[0-9a-f]* "\([^"]*\)".*/\1/p' <<<"$host_line")
+say "   tracker:    ${host_line:-none}  ($detect)"
+
+if [[ -n $host_id && $(field "$detect" hasHost) == "True" ]]; then
+    pass "found the herdr host window over X11: $host_id \"$host_name\""
+else
+    fail "no host window found (log: $EVID/track-detect.log)"
+fi
+
+if [[ -n $host_id ]]; then
+    host_pid=$(xprop -id "$host_id" _NET_WM_PID 2>/dev/null | sed 's/.*= //')
+    host_cmd=$(tr '\0' ' ' <"/proc/$host_pid/cmdline" 2>/dev/null)
+    hosts_out=$( DISPLAY=$REAL_DISPLAY "$PROBE" hosts )
+    ancestry=$(sed -n 's/^HOSTS //p' <<<"$hosts_out")
+    say "   ancestry:   ${hosts_out//$'\n'/ | }"
+    say "   window pid: ${host_pid:-none} (${host_cmd:-unknown})"
+    if [[ -n $host_pid && ",$ancestry," == *",$host_pid,"* ]]; then
+        pass "the /proc ppid walk resolves that window's owner ($host_pid ${host_cmd% }) — the pid path works here"
+    else
+        fail "the ancestry walk (${ancestry:-none}) does not contain the window owner ($host_pid)"
+    fi
+    # A terminal title follows its tab, so it is reported for context and never asserted on.
+    say "   title:      '$host_name' (follows the terminal's active tab; not the discovery signal)"
+
+    geo_x=$(xwininfo -id "$host_id" | sed -n 's/.*Absolute upper-left X: *//p')
+    geo_y=$(xwininfo -id "$host_id" | sed -n 's/.*Absolute upper-left Y: *//p')
+    geo_w=$(xwininfo -id "$host_id" | sed -n 's/.*Width: *//p')
+    geo_h=$(xwininfo -id "$host_id" | sed -n 's/.*Height: *//p')
+    extents=$(xprop -id "$host_id" _NET_FRAME_EXTENTS 2>/dev/null | sed 's/.*= //')
+    say "   xwininfo:   ${geo_w}x${geo_h}+${geo_x}+${geo_y}  frame extents: ${extents:-none (client-side decorations)}"
+    if eq_num "$(field "$detect" rect.x)" "$geo_x" && eq_num "$(field "$detect" rect.y)" "$geo_y" \
+       && eq_num "$(field "$detect" rect.w)" "$geo_w" && eq_num "$(field "$detect" rect.h)" "$geo_h"; then
+        pass "published rect matches X's geometry for that window (${geo_w}x${geo_h}+${geo_x}+${geo_y})"
+    else
+        fail "published rect does not match X's geometry (${geo_w}x${geo_h}+${geo_x}+${geo_y})"
+    fi
+    if [[ -n $geo_y ]] && eq_num "$(field "$detect" rect.y)" "$geo_y"; then
+        pass "the window-frame offset is included: y=$(field "$detect" rect.y) matches xwininfo's absolute y"
+    else
+        fail "y is $(field "$detect" rect.y), xwininfo says ${geo_y:-?}"
+    fi
+fi
+unset DISPLAY
+
+# ================================================================ 2. interaction, on a throwaway display
+say ""
+say "-- interaction: a move, a minimize-shaped hide and the grab tests run on $SIDE_DISPLAY, never on the operator's"
+if ! DISPLAY=$SIDE_DISPLAY xdpyinfo >/dev/null 2>&1; then
+    Xvfb "$SIDE_DISPLAY" -screen 0 1024x768x24 -nolisten tcp -ac >"$EVID/xvfb.log" 2>&1 &
+    STARTED_XVFB=1
+    for _ in $(seq 1 150); do
+        DISPLAY=$SIDE_DISPLAY xdpyinfo >/dev/null 2>&1 && break
+        sleep 0.02
+    done
+fi
+side_up=0
+DISPLAY=$SIDE_DISPLAY xdpyinfo >/dev/null 2>&1 && side_up=1
+if [[ $side_up == 1 ]]; then
+    pass "throwaway display $SIDE_DISPLAY is available for the interactive checks"
+else
+    fail "could not start $SIDE_DISPLAY; the interactive checks cannot run"
+fi
+
+HELPER=""
+HELPER_PID=""
+HELPER_TITLE="herdr-voice x11 check (auto-closes)"
+if [[ $side_up == 1 ]]; then
+    # 420x320 and owned by the terminal's pid: WindowPin only considers normal-size windows whose owner is a host,
+    # so the helper has to look like a terminal window and not like a dialog.
+    # A helper left behind by an interrupted run would be a second candidate, and `tail -1` would pick that one.
+    for stale in $(DISPLAY=$SIDE_DISPLAY xdotool search --name 'herdr-voice x11 check' 2>/dev/null); do
+        DISPLAY=$SIDE_DISPLAY xdotool windowkill "$stale" 2>/dev/null
+    done
+    DISPLAY=$SIDE_DISPLAY xmessage -title "$HELPER_TITLE" -geometry 420x320 -buttons OK 'helper window' >/dev/null 2>&1 &
+    HELPER_PID=$!
+    for _ in $(seq 1 150); do
+        HELPER=$(DISPLAY=$SIDE_DISPLAY xdotool search --name "herdr-voice x11 check" 2>/dev/null | tail -1)
+        [[ -n $HELPER ]] && break
+        sleep 0.02
+    done
+    if [[ -n $HELPER ]]; then
+        # There is no window manager here, so the EWMH root properties a window manager would maintain are written
+        # by the check itself: that is exactly the input the tracker reads.
+        DISPLAY=$SIDE_DISPLAY xprop -root -f _NET_CLIENT_LIST 32x -set _NET_CLIENT_LIST "$HELPER" >/dev/null 2>&1
+        DISPLAY=$SIDE_DISPLAY xprop -root -f _NET_CURRENT_DESKTOP 32c -set _NET_CURRENT_DESKTOP 0 >/dev/null 2>&1
+        # A real terminal window is owned by the terminal process, which is what puts it in the tracker's host set.
+        if [[ -n ${host_pid:-} ]]; then
+            DISPLAY=$SIDE_DISPLAY xprop -id "$HELPER" -f _NET_WM_PID 32c -set _NET_WM_PID "$host_pid" >/dev/null 2>&1
+        else
+            fail "no host pid was discovered in phase 1, so the helper cannot stand in for a terminal window"
+        fi
+        pass "one helper window on $SIDE_DISPLAY, advertised through a _NET_CLIENT_LIST the check writes itself"
+    else
+        fail "could not create the helper window on $SIDE_DISPLAY"
+    fi
+fi
+
+if [[ -n ${HELPER:-} ]]; then
+    DISPLAY=$SIDE_DISPLAY HERDR_VOICE_DEBUG_WINDOW=1 "$PROBE" track 40 >"$EVID/track-move.log" 2>&1 &
+    PROBE_PID_A=$!
+    if wait_log "$EVID/track-move.log" "host window $(printf '0x%x' "$HELPER")" 8000; then
+        pass "the tracker follows the window whose title mentions herdr (the title path)"
+    else
+        fail "the tracker did not pick up the herdr-titled window ($EVID/track-move.log)"
+    fi
+
+    # ---- frame extents arithmetic
+    say "-- frame extents: the rect grows by the decoration the window manager drew"
+    before=$( DISPLAY=$SIDE_DISPLAY "$PROBE" rect "$HELPER" )
+    DISPLAY=$SIDE_DISPLAY xprop -id "$HELPER" -f _NET_FRAME_EXTENTS 32c -set _NET_FRAME_EXTENTS "8, 8, 24, 12" >/dev/null 2>&1
+    after=$( DISPLAY=$SIDE_DISPLAY "$PROBE" rect "$HELPER" )
+    bx=$(field "$(sed 's/^RECT //' <<<"$before")" rect.x); by=$(field "$(sed 's/^RECT //' <<<"$before")" rect.y)
+    bh=$(field "$(sed 's/^RECT //' <<<"$before")" rect.h)
+    ax=$(field "$(sed 's/^RECT //' <<<"$after")" rect.x); ay=$(field "$(sed 's/^RECT //' <<<"$after")" rect.y)
+    ah=$(field "$(sed 's/^RECT //' <<<"$after")" rect.h)
+    say "   without extents:  ($bx,$by) height $bh"
+    say "   extents 8,8,24,12: ($ax,$ay) height $ah"
+    if python3 -c "import sys; sys.exit(0 if float('$ax')==float('$bx')-8 and float('$ay')==float('$by')-24 and float('$ah')==float('$bh')+36 else 1)" 2>/dev/null; then
+        pass "extents shift the rect by left/top and grow it by left+right and top+bottom"
+    else
+        fail "extents math is wrong: ($bx,$by,$bh) -> ($ax,$ay,$ah)"
+    fi
+    DISPLAY=$SIDE_DISPLAY xprop -id "$HELPER" -remove _NET_FRAME_EXTENTS >/dev/null 2>&1
+
+    # ---- move tracking
+    say ""
+    say "-- tracking: a move reaches the tracker within 250 ms"
+    # The window's own border means the client origin sits one pixel inside the corner xdotool is given, so the
+    # expectation is X's absolute position rather than the number passed to the move.
+    # `getwindowgeometry` reports the client origin, the same convention the tracker publishes, so a border can't
+    # make the expectation disagree with the answer by a pixel.
+    eval "$(DISPLAY=$SIDE_DISPLAY xdotool getwindowgeometry --shell "$HELPER")"
+    before_x=$X
+    before_y=$Y
+    t0=$(date +%s%3N)
+    DISPLAY=$SIDE_DISPLAY xdotool windowmove "$HELPER" 320 210
+    if read -r seen pub_x pub_y <<<"$(wait_rect_change "$EVID/track-move.log" "$before_x" "$before_y" "$t0" 2000)"; then
+        latency=$(( ${seen:-0} - ${t0:-0} ))
+        say "   moved the window to 320,210; the tracker published ($pub_x,$pub_y) after ${latency}ms"
+        if (( latency <= 250 )); then
+            pass "the published rect followed the window move in ${latency}ms (<= 250ms)"
+        else
+            fail "the published rect took ${latency}ms to follow the move (> 250ms)"
+        fi
+        if python3 -c "import sys; sys.exit(0 if abs(float('$pub_x')-320)<=2 and abs(float('$pub_y')-210)<=2 else 1)"; then
+            pass "the published rect is the window's new position, within the client-side border"
+        else
+            fail "the published rect ($pub_x,$pub_y) is not near (320,210)"
+        fi
+    else
+        fail "the tracker never published a rect change after the move"
+    fi
+
+    # ---- hiding: unmapped, the way a minimize ends up
+    say ""
+    say "-- hiding: an unmapped window reports (true, nil); mapping it again brings the frame back"
+    DISPLAY=$SIDE_DISPLAY xdotool windowunmap "$HELPER"
+    if wait_event "$EVID/track-move.log" "d['hasHost'] and r is None" 3000; then
+        pass "unmapped window publishes hasHost=true with no rect: the orb hides instead of going to the corner"
+    else
+        fail "unmapping did not publish (true, nil)"
+    fi
+    DISPLAY=$SIDE_DISPLAY xdotool windowmap "$HELPER"
+    if wait_event "$EVID/track-move.log" "d['hasHost'] and r and r['w'] > 50" 3000; then
+        pass "mapped again, it publishes its frame: the orb comes back"
+    else
+        fail "mapping the window again did not bring the frame back"
+    fi
+
+    # ---- hiding: the state a window manager writes when it iconifies a window
+    say "-- hiding: the state a window manager writes on minimize (_NET_WM_STATE_HIDDEN + WM_STATE: Iconic)"
+    DISPLAY=$SIDE_DISPLAY xprop -id "$HELPER" -f _NET_WM_STATE 32a -set _NET_WM_STATE "_NET_WM_STATE_HIDDEN" >/dev/null 2>&1
+    DISPLAY=$SIDE_DISPLAY xprop -id "$HELPER" -f WM_STATE 32c -set WM_STATE "3, 0" >/dev/null 2>&1
+    if wait_event "$EVID/track-move.log" "d['hasHost'] and r is None" 3000; then
+        pass "a mapped but iconified window publishes (true, nil): minimized windows hide the orb"
+    else
+        fail "iconified state did not publish (true, nil)"
+    fi
+    DISPLAY=$SIDE_DISPLAY xprop -id "$HELPER" -remove _NET_WM_STATE >/dev/null 2>&1
+    DISPLAY=$SIDE_DISPLAY xprop -id "$HELPER" -remove WM_STATE >/dev/null 2>&1
+    if wait_event "$EVID/track-move.log" "d['hasHost'] and r and r['w'] > 50" 3000; then
+        pass "restored to normal, it publishes its frame again"
+    else
+        fail "restoring the normal state did not bring the frame back"
+    fi
+
+    # ---- cost discipline
+    say ""
+    say "-- cost: 10 Hz while the tracked window has the focus, 1 Hz while it does not"
+    DISPLAY=$SIDE_DISPLAY xprop -root -f _NET_ACTIVE_WINDOW 32x -set _NET_ACTIVE_WINDOW "$HELPER" >/dev/null 2>&1
+    if wait_log "$EVID/track-move.log" 'cadence 100ms' 4000; then
+        pass "the tracker polls at 10 Hz while the tracked terminal has the focus"
+    else
+        fail "no 10 Hz cadence while the tracked window had the focus"
+    fi
+    DISPLAY=$SIDE_DISPLAY xprop -root -f _NET_ACTIVE_WINDOW 32x -set _NET_ACTIVE_WINDOW "0x0" >/dev/null 2>&1
+    if wait_log "$EVID/track-move.log" 'cadence 1000ms' 4000; then
+        pass "the tracker drops to 1 Hz once the tracked window is no longer in front"
+    else
+        fail "no 1 Hz cadence after the focus moved away"
+    fi
+
+    kill "$PROBE_PID_A" 2>/dev/null; wait "$PROBE_PID_A" 2>/dev/null; PROBE_PID_A=""
+else
+    fail "skipped the tracking and hiding checks: no helper window"
+fi
+
+# ================================================================ 3. hotkeys, on the throwaway display
+say ""
+say "-- hotkeys: ctrl+alt+m reaches the mute handler (grabs tested on $SIDE_DISPLAY)"
+DISPLAY=$SIDE_DISPLAY HERDR_VOICE_DEBUG_KEYS=1 "$PROBE" hotkeys "" 6 >"$EVID/hotkey-mute.log" 2>&1 &
+PROBE_PID_A=$!
+if wait_log "$EVID/hotkey-mute.log" 'Ctrl\+Alt\+M grabbed' 4000; then
+    pass "ctrl+alt+m is grabbed on the root window"
+else
+    fail "the mute binding was never grabbed ($EVID/hotkey-mute.log)"
+fi
+DISPLAY=$SIDE_DISPLAY xdotool key ctrl+alt+m
+if wait_log "$EVID/hotkey-mute.log" 'HOTKEY mute' 2000; then
+    pass "ctrl+alt+m fires the mute handler"
+else
+    fail "ctrl+alt+m did not fire the handler"
+fi
+kill "$PROBE_PID_A" 2>/dev/null; wait "$PROBE_PID_A" 2>/dev/null; PROBE_PID_A=""
+
+say "-- hotkeys: Esc fires only while the assistant is speaking"
+CONTROL="$EVID/stopkey-control"
+printf 'inactive\n' >"$CONTROL"
+DISPLAY=$SIDE_DISPLAY HERDR_VOICE_DEBUG_KEYS=1 "$PROBE" hotkeys "$CONTROL" 9 >"$EVID/hotkey-esc.log" 2>&1 &
+PROBE_PID_A=$!
+wait_log "$EVID/hotkey-esc.log" 'Ctrl\+Alt\+M grabbed' 4000
+sleep 0.5
+DISPLAY=$SIDE_DISPLAY xdotool key Escape          # inactive: every other app keeps its Esc
+sleep 0.5
+printf 'active\n' >"$CONTROL"
+if wait_log "$EVID/hotkey-esc.log" 'Esc grabbed' 3000; then
+    pass "Esc is grabbed when the assistant starts speaking"
+else
+    fail "Esc was not grabbed after the stop key became active"
+fi
+sleep 0.3
+DISPLAY=$SIDE_DISPLAY xdotool key Escape          # active: stops the speech
+sleep 0.5
+printf 'inactive\n' >"$CONTROL"
+if wait_log "$EVID/hotkey-esc.log" 'Esc released' 3000; then
+    pass "Esc is released when the assistant stops speaking"
+else
+    fail "Esc was not released"
+fi
+sleep 0.3
+DISPLAY=$SIDE_DISPLAY xdotool key Escape          # released: must not fire
+sleep 0.6
+esc_fires=$(grep -c 'HOTKEY esc' "$EVID/hotkey-esc.log")
+if [[ $esc_fires == 1 ]]; then
+    pass "Esc fired exactly once, only during the speaking window"
+else
+    fail "Esc fired $esc_fires times, expected exactly 1 (only while active)"
+fi
+kill "$PROBE_PID_A" 2>/dev/null; wait "$PROBE_PID_A" 2>/dev/null; PROBE_PID_A=""
+
+say "-- hotkeys: a claimed binding warns instead of crashing"
+printf 'inactive\n' >"$CONTROL"
+DISPLAY=$SIDE_DISPLAY HERDR_VOICE_DEBUG_KEYS=1 "$PROBE" hotkeys "$CONTROL" 10 >"$EVID/hotkey-holder.log" 2>&1 &
+PROBE_PID_A=$!
+wait_log "$EVID/hotkey-holder.log" 'Ctrl\+Alt\+M grabbed' 4000
+DISPLAY=$SIDE_DISPLAY "$PROBE" hotkeys "" 2 >"$EVID/hotkey-conflict.log" 2>&1
+conflict_status=$?
+if grep -q 'could not register Ctrl+Alt+M; click the orb to mute' "$EVID/hotkey-conflict.log"; then
+    pass "a second process reports the conflict: 'could not register Ctrl+Alt+M; click the orb to mute'"
+else
+    fail "no conflict warning when ctrl+alt+m was already grabbed"
+fi
+if [[ $conflict_status == 0 ]]; then
+    pass "the conflicting process exits cleanly (status 0): it warns, it does not crash"
+else
+    fail "the conflicting process exited $conflict_status"
+fi
+# The same for Esc: the first process holds it while active, so the second must warn rather than steal it.
+printf 'active\n' >"$CONTROL"
+if wait_log "$EVID/hotkey-holder.log" 'Esc grabbed' 3000; then
+    pass "the first process holds Esc while active, for the conflict case"
+else
+    fail "the first process never grabbed Esc, so the Esc conflict case could not be set up"
+fi
+DISPLAY=$SIDE_DISPLAY HERDR_VOICE_DEBUG_KEYS=1 "$PROBE" hotkeys "$CONTROL" 3 >"$EVID/hotkey-esc-conflict.log" 2>&1
+if grep -q 'could not grab Esc' "$EVID/hotkey-esc-conflict.log"; then
+    pass "an already-grabbed Esc is reported: 'could not grab Esc; say \"stop\" or talk over the voice instead'"
+else
+    fail "no warning when Esc was already grabbed"
+fi
+kill "$PROBE_PID_A" 2>/dev/null; wait "$PROBE_PID_A" 2>/dev/null; PROBE_PID_A=""
+
+# ---------------------------------------------------------------- cleanup + summary
+say ""
+if [[ -n ${HELPER:-} ]]; then
+    DISPLAY=$SIDE_DISPLAY xdotool windowkill "$HELPER" 2>/dev/null
+    HELPER=""
+fi
+if [[ -n ${HELPER_PID:-} ]]; then
+    kill "$HELPER_PID" 2>/dev/null
+    HELPER_PID=""
+fi
+if [[ ${STARTED_XVFB:-0} == 1 ]]; then
+    pkill -f "Xvfb $SIDE_DISPLAY " 2>/dev/null
+fi
+leftover=$(DISPLAY=$REAL_DISPLAY xdotool search --name 'herdr-voice x11 check' 2>/dev/null | wc -l)
+if [[ $leftover == 0 ]]; then
+    pass "nothing was created on $REAL_DISPLAY, and the helper window is gone"
+else
+    fail "$leftover helper window(s) left on $REAL_DISPLAY"
+fi
+
+say ""
+say "== $PASSED passed, $FAILED failed =="
+for check in "${CHECKS[@]}"; do say "   $check"; done
+say "logs: $EVID"
+exit "$FAILED"

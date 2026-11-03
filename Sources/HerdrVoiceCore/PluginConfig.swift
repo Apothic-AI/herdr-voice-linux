@@ -7,8 +7,8 @@ public enum PluginConfig {
     public static let fileName = "config.env"
 
     /// `KEY=VALUE` lines; blank lines and `#` comments are skipped, an `export ` prefix and surrounding quotes are
-    /// dropped. Only HERDR_VOICE_* keys are taken: API keys belong in the Keychain (`herdr-voice setup`), never in
-    /// a plain file, so they and anything unknown come back as `rejected`.
+    /// dropped. Only HERDR_VOICE_* keys are taken: API keys belong in the platform secret store
+    /// (`herdr-voice setup`), never in a plain file, so they and anything unknown come back as `rejected`.
     public static func parse(_ text: String) -> (settings: [(key: String, value: String)], rejected: [String]) {
         var settings: [(key: String, value: String)] = []
         var rejected: [String] = []
@@ -32,7 +32,7 @@ public enum PluginConfig {
     /// Written on first run so the settings are easy to find; everything commented out.
     public static let template = """
     # herdr-voice settings. Uncomment a line to use it; restart herdr-voice to apply.
-    # API keys don't go here: run `herdr-voice setup` (they're kept in your macOS Keychain).
+    # API keys don't go here: run `herdr-voice setup` (they're kept in your Keychain or secret service).
 
     # AI model: local, grok, openai or gemini (default: local once it's set up, otherwise grok)
     # HERDR_VOICE_PROVIDER=local

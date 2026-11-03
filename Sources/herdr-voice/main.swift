@@ -1,4 +1,4 @@
-import AppKit
+import Foundation
 import HerdrVoiceCore
 
 // ponytail: Swift 5 language mode with main-queue confinement instead of actors; move to Swift 6 strict
@@ -12,7 +12,7 @@ if let dir = ProcessInfo.processInfo.environment["HERDR_PLUGIN_CONFIG_DIR"] {
         for (key, value) in settings { setenv(key, value, 0) } // a real environment variable still wins
         if !rejected.isEmpty {
             log("⚠ \(PluginConfig.fileName): ignored \(rejected.joined(separator: ", ")) (only HERDR_VOICE_* settings; "
-                + "API keys go in the Keychain with herdr-voice setup)")
+                + "API keys go in the \(Keychain.storeDescription) with herdr-voice setup)")
         }
     } else {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -37,7 +37,7 @@ if args.count > 1 {
         herdr-voice --here             start it in this pane
         herdr-voice --provider NAME    use local, grok, openai or gemini (default: local once set up, else grok)
         herdr-voice stop               stop the running voice
-        herdr-voice setup [NAME]       store an API key in the Keychain
+        herdr-voice setup [NAME]       store an API key in the platform secret store
         herdr-voice install-command    put herdr-voice on your PATH (~/.local/bin)
         herdr-voice uninstall-command  undo install-command
         herdr-voice tool [NAME JSON]   run one of the voice's tools by hand
@@ -97,17 +97,40 @@ if args.count > 1, args[1] == "tool" {
     exit(0)
 }
 
-// Whatever was in front when we were launched: normally the terminal running Herdr.
-let launchedFrom = NSWorkspace.shared.frontmostApplication
-let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
-// An accessory app can still be activated at launch; it then holds focus with no window to type into, so
-// keystrokes stop reaching the terminal (and the pinned orb hides). Hand focus straight back.
-DispatchQueue.main.async {
-    guard NSApp.isActive, let previous = launchedFrom, previous.processIdentifier != getpid() else { return }
-    NSApp.yieldActivation(to: previous)
-    previous.activate()
+// Platform presentation: AppKit hands focus straight back to the terminal on macOS; on Linux there is no
+// activation policy and the orb never takes focus, so it does nothing.
+AppHost.prepareForLaunch()
+
+/// Stops every thread that is inside a library the C runtime finalises, then leaves.
+///
+/// The order is the point. Linux reaches X11 and PortAudio through `dlopen`, and `exit()` finalises those libraries; a
+/// thread still inside one at that moment is exactly how this process used to jump to a garbage address on SIGTERM.
+/// The crash report's own thread list had the X11 loop thread alive at the moment of the jump, with
+/// `libasound_module_pcm_speex` on the stack (`swarm-i9f.18`). Stopping each owner first means nothing is inside a
+/// library when it is finalised. The `#if` is the whole platform difference: AppKit and AVFoundation are linked, not
+/// `dlopen`ed, so on macOS there is no such teardown running underneath a live thread.
+func stopOwners() {
+    #if os(Linux)
+    session.audio.stop() // PortAudio's callbacks end before its library is finalised
+    windowTracker.stop() // each X11 loop closes its own connection, on its own thread
+    Hotkey.stop()
+    orb.stop()
+    #endif
 }
+
+/// Closes the billable session, stops the threads that own native libraries, takes the Electron host down, then leaves.
+/// `localRuntime.stop()` is last because reaping the helper is the slowest step and it must not delay the socket close
+/// and the audio release ahead of it.
+func shutDown(_ code: Int32) -> Never {
+    session.shutdown()  // close the provider socket: billing stops now, and no audio egress is left open
+    stopOwners()
+    localRuntime.stop() // SIGTERM the Electron host and reap it, so no orphan is left holding the GPU
+    exit(code)
+}
+
+// Kept alive for the life of the process: a dispatch source that goes out of scope stops delivering, and this one
+// only exists to catch ctrl+c.
+var demoSources: [DispatchSourceSignal] = []
 
 // --orb-demo: orb only, driven by the live mic, cycling moods every 4s. No network, no key.
 if args.contains("--orb-demo") {
@@ -132,10 +155,30 @@ if args.contains("--orb-demo") {
         let thinking = mood == .working || (moods[(phase + 1) % moods.count] == .speaking && t > 2.5)
         return Orb.Frame(mood: mood, mic: audio.micLevel, voice: audio.isSpeaking ? audio.outLevel : 0, thinking: thinking)
     }
-    do { try audio.start() } catch { log("✖ audio: \(error.localizedDescription)"); exit(1) }
+    do {
+        try audio.start()
+    } catch {
+        // A stubbed or unavailable audio backend is not a reason to take the demo off the screen: the orb is the thing
+        // being demoed, and `OrbDemo.levels` supplies its own envelopes once no level arrives. This used to `exit(1)`
+        // here and hold the process open from an `atexit` handler, which then swallowed every later exit — including
+        // ctrl+c — because that handler ran a CFRunLoop that never returns.
+        log("⚠ orb demo: \(error.localizedDescription); the orb keeps drawing with synthesised levels")
+    }
     log("orb demo: talk to see it react; ctrl+c to quit")
-    signal(SIGINT) { _ in exit(0) }
-    app.run()
+    // A dispatch source, not a `signal` handler: the stop below closes the audio device and the X connection, and only
+    // a real thread may do that. Ignoring the signal first is what lets the dispatch source receive it.
+    signal(SIGINT, SIG_IGN)
+    let stopDemo = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    stopDemo.setEventHandler {
+        #if os(Linux)
+        audio.stop()
+        orb.stop()
+        #endif
+        exit(0)
+    }
+    stopDemo.resume()
+    demoSources.append(stopDemo)
+    AppHost.runMainLoop()
 }
 
 guard let provider = Provider(rawValue: providerName) else {
@@ -214,7 +257,9 @@ func loadLocal(onFailure: @escaping (Error) -> Void) {
         }
     }
 }
-// A lost local connection means the helper crashed: relaunch it, backing off like any failed reconnect.
+// A lost local connection is redialed on the helper's port while the helper is alive; only a helper that is really
+// gone is relaunched (see Reconnect.relaunchesHelper). A second, slower failure backs off like any other reconnect.
+session.localHelperAlive = { localRuntime.isRunning }
 session.relaunchLocalHelper = {
     loadLocal { session.localRelaunchFailed("Local OpenLive relaunch failed: \($0.localizedDescription)") }
 }
@@ -253,12 +298,23 @@ func modelChoices() -> [Orb.MenuChoice] {
     }
 }
 let orb = Orb(onClick: { session.toggleMute() }, menuChoices: modelChoices, onQuit: {
+    // A moment for the WebSocket close frame to go out, then the same ordered stop a signal gets.
     session.shutdown()
-    localRuntime.stop()
-    // A moment for the WebSocket close frame to go out.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(0) }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { shutDown(0) }
 })
 Hotkey.registerMute { session.toggleMute() }
+
+// A SIGTERM (a check, a closing pane, `pkill`) must take the helper down with it: an orphaned Electron host holds the
+// GPU and its model cache. The orb's quit path stops the same things, so both exits behave alike, and the sources
+// stay alive in `signalSources` where a signal cannot free one mid-handler.
+var signalSources: [DispatchSourceSignal] = []
+for sig in [SIGTERM, SIGINT, SIGHUP] {
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler { shutDown(0) }
+    source.resume()
+    signalSources.append(source)
+}
 
 // Pin the orb to the terminal window showing Herdr; HERDR_VOICE_ORB_PIN=0 keeps it in the screen corner.
 let windowTracker = WindowTracker()
@@ -273,32 +329,46 @@ session.audio.onSpeakingChanged = { speaking in
     Hotkey.setStopKey(active: speaking) { session.stopSpeech(reason: "Esc") }
 }
 
+/// The orb's mood as of the last frame, so a change is logged once instead of once per frame.
+final class MoodTicker {
+    private var last: Mood?
+    func changed(to mood: Mood) -> Bool {
+        guard mood != last else { return false }
+        last = mood
+        return true
+    }
+}
+let moodTicker = MoodTicker()
+
 orb.run {
     let a = session.audio
     let loading = localActivation.loading
-    let mood = Activity.mood(loading: loading, disconnected: session.status == .disconnected,
+    // Anything but a live session is offline as far as the microphone is concerned: never show listening-blue while
+    // what is said has nowhere to go. Red while reconnecting, blue again the moment the session is back.
+    let live = session.status == .live
+    let mood = Activity.mood(loading: loading, disconnected: !live,
                              dormant: session.dormant, muted: session.muted, speaking: a.isSpeaking,
                              agentsWorking: !session.busyAgents.isEmpty, micQuiet: a.micLevel < 0.02)
+    if moodTicker.changed(to: mood) { log("◎ orb: \(mood)") }
     // Both directions at once: talking over the assistant shows your push and its core together.
     return Orb.Frame(mood: mood, mic: session.muted ? 0 : a.micLevel, voice: a.isSpeaking ? a.outLevel : 0,
-                     thinking: loading || (session.status != .disconnected && session.thinking))
+                     thinking: loading || (live && session.thinking))
 }
 
 do {
     try session.start()
 } catch {
     log("✖ audio: \(error.localizedDescription) — allow microphone access for your terminal in System Settings")
-    exit(1)
+    shutDown(1)
 }
 if provider == .local {
     log("◌ loading Local OpenLive WebGPU speech models")
     loadLocal { error in
         FileHandle.standardError.write(Data("Local OpenLive failed: \(error.localizedDescription)\nNo cloud fallback was selected.\n".utf8))
-        exit(2)
+        shutDown(2)
     }
 }
-signal(SIGINT) { _ in exit(0) }
-app.run()
+AppHost.runMainLoop()
 
 /// 220 Hz with a wandering pitch, amplitude-shaped into ~4 "syllables" a second, as base64 PCM16 24 kHz.
 func demoSpeech(seconds: Double) -> String {

@@ -1,17 +1,64 @@
 name: CI
-on:
+# Every job needs a timeout-minutes. Without one a hung step runs until GitHub's 6-hour default: that happened here
+# twice (swift-linux sat in `swift test` and was cancelled after 6h1m on run 40804926545, and again for 15+ minutes on
+# 41280501269 where it had to be cancelled by hand). A hang should read as a failed check in minutes.
+#
+# A bare timeout only says "cancelled", which has now cost four investigations. The swift test step below is bounded
+# and dumps the process tree and every thread's stack when the bound is hit, so the next hang names the code that hung.
+on: 
   pull_request:
   push:
     branches-ignore: [main, master]
 jobs:
-  swift:
+  swift-macos:
     runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: swift test
       - run: swift build -c release
+  swift-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@v2
+        with: { swift-version: "6.0" }
+      # The Linux halves of the app talk to X11, Cairo and PortAudio directly; the package's
+      # systemLibrary targets find them through pkg-config.
+      - run: sudo apt-get update && sudo apt-get install -y libx11-dev libxrender-dev libcairo2-dev portaudio19-dev
+      - run: swift build
+      # swift test has hung inside this runner and never locally: 203 tests pass in 2.5 s, five runs in a row, with no
+      # display and no PulseAudio server. Three CI runs hung there (40804926545 for 6h1m, 41280501269/41280497476, and
+      # 41281756653 while the identical push of the identical SHA passed) and `Run swift test` is where each sat. The
+      # bound is what turns that into evidence instead of a cancel notice.
+      - name: swift test
+        run: |
+          set +euo pipefail
+          log="$RUNNER_TEMP/swift-test.log"
+          timeout --kill-after=15s 420 swift test 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::swift test exited $rc - process tree"
+            ps -eo pid,ppid,etime,stat,args --forest || true
+            echo "::endgroup::"
+            if command -v gdb >/dev/null 2>&1 || sudo apt-get install -y gdb >/dev/null 2>&1; then
+              for pid in $(pgrep -f 'swift-testing|\.build/' || true); do
+                echo "::group::threads of $pid ($(cat /proc/$pid/comm 2>/dev/null))"
+                sudo gdb -p "$pid" -batch -ex 'thread apply all bt 8' 2>&1 | grep -v '^\[New LWP' | head -150 || true
+                echo "::endgroup::"
+              done
+            else
+              echo "no gdb available; thread stacks not dumped"
+            fi
+            echo "--- last lines of the test log ---"
+            tail -40 "$log" || true
+          fi
+          exit "$rc"
+      - run: swift build -c release
   local-openlive:
     runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -22,6 +69,24 @@ jobs:
       - run: pnpm install --frozen-lockfile
         working-directory: local-openlive
       - run: pnpm build # syncs the pinned OpenLive source into vendor/, which check and test import
+        working-directory: local-openlive
+      - run: pnpm check
+        working-directory: local-openlive
+      - run: pnpm test
+        working-directory: local-openlive
+  local-openlive-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.5.2 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22.22.3, cache: pnpm, cache-dependency-path: local-openlive/pnpm-lock.yaml }
+      - run: ./scripts/local-openlive-source
+      - run: pnpm install --frozen-lockfile
+        working-directory: local-openlive
+      - run: pnpm build
         working-directory: local-openlive
       - run: pnpm check
         working-directory: local-openlive
