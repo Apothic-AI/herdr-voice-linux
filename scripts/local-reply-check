@@ -80,10 +80,17 @@ say "== 1. the app, capturing from the virtual microphone =="
 # (AudioEngine.swift:159) and PULSE_SINK never reaches PortAudio, so relying on it left the app playing the greeting
 # into the operator's real speakers. Device selection happens before the session connects, so a fallback is caught
 # and the app killed before it can make a sound.
+#
+# HERDR_VOICE_GATE_DEBUG=1 is for the failing run. When no transcript appears, the gate meter is the only line in this
+# log that separates the two faults behind that one symptom: the microphone never heard the utterance (no OPEN at all)
+# from the microphone hearing it and the onset being suppressed by a pending reply (OPEN with `pending yes`). The
+# second leaves no other trace, and it is the shape a stuck reply takes. On a passing run it adds a meter line every
+# 5 s, which is what makes a failing run diagnosable from the log alone rather than from a rebuilt binary.
 env DISPLAY="${DISPLAY:-:1}" \
     HERDR_VOICE_OUTPUT_DEVICE="$out_sink" \
     HERDR_VOICE_INPUT_DEVICE="$mic_source" HERDR_VOICE_ECHO_CANCEL=0 \
     HERDR_VOICE_DEBUG_EVENTS=1 \
+    HERDR_VOICE_GATE_DEBUG=1 \
     "$bin" --provider local --here >"$log" 2>&1 &
 app_pid=$!
 
